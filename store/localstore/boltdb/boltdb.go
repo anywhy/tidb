@@ -19,8 +19,8 @@ import (
 
 	"github.com/boltdb/bolt"
 	"github.com/juju/errors"
-	"github.com/ngaut/log"
 	"github.com/pingcap/tidb/store/localstore/engine"
+	"github.com/pingcap/tidb/util/bytes"
 )
 
 var (
@@ -28,7 +28,7 @@ var (
 )
 
 var (
-	bucketName = []byte("tidb_bucket")
+	bucketName = []byte("tidb")
 )
 
 type db struct {
@@ -42,23 +42,66 @@ func (d *db) Get(key []byte) ([]byte, error) {
 		b := tx.Bucket(bucketName)
 		v := b.Get(key)
 		if v == nil {
-			return nil
+			return errors.Trace(engine.ErrNotFound)
 		}
-
-		value = append([]byte(nil), v...)
-
+		value = bytes.CloneBytes(v)
 		return nil
 	})
 
 	return value, errors.Trace(err)
 }
 
-func (d *db) Seek(startKey []byte) (engine.Iterator, error) {
-	tx, err := d.DB.Begin(false)
+func (d *db) Seek(startKey []byte) ([]byte, []byte, error) {
+	var key, value []byte
+	err := d.DB.View(func(tx *bolt.Tx) error {
+		b := tx.Bucket(bucketName)
+		c := b.Cursor()
+		var k, v []byte
+		if startKey == nil {
+			k, v = c.First()
+		} else {
+			k, v = c.Seek(startKey)
+		}
+		if k != nil {
+			key, value = bytes.CloneBytes(k), bytes.CloneBytes(v)
+		}
+		return nil
+	})
+
 	if err != nil {
-		return nil, errors.Trace(err)
+		return nil, nil, errors.Trace(err)
 	}
-	return &iterator{tx: tx, key: startKey}, nil
+	if key == nil {
+		return nil, nil, errors.Trace(engine.ErrNotFound)
+	}
+	return key, value, nil
+}
+
+func (d *db) SeekReverse(startKey []byte) ([]byte, []byte, error) {
+	var key, value []byte
+	err := d.DB.View(func(tx *bolt.Tx) error {
+		b := tx.Bucket(bucketName)
+		c := b.Cursor()
+		var k, v []byte
+		if startKey == nil {
+			k, v = c.Last()
+		} else {
+			c.Seek(startKey)
+			k, v = c.Prev()
+		}
+		if k != nil {
+			key, value = bytes.CloneBytes(k), bytes.CloneBytes(v)
+		}
+		return nil
+	})
+
+	if err != nil {
+		return nil, nil, errors.Trace(err)
+	}
+	if key == nil {
+		return nil, nil, errors.Trace(engine.ErrNotFound)
+	}
+	return key, value, nil
 }
 
 func (d *db) NewBatch() engine.Batch {
@@ -95,52 +138,6 @@ func (d *db) Close() error {
 	return d.DB.Close()
 }
 
-type iterator struct {
-	tx *bolt.Tx
-	*bolt.Cursor
-
-	key   []byte
-	value []byte
-}
-
-func (i *iterator) Next() bool {
-	if i.Cursor == nil {
-		i.Cursor = i.tx.Bucket(bucketName).Cursor()
-		if i.key == nil {
-			i.key, i.value = i.Cursor.First()
-		} else {
-			i.key, i.value = i.Cursor.Seek(i.key)
-		}
-	} else {
-		i.key, i.value = i.Cursor.Next()
-	}
-
-	return i.key != nil
-}
-
-func (i *iterator) Seek(startKey []byte) bool {
-	if i.Cursor == nil {
-		i.Cursor = i.tx.Bucket(bucketName).Cursor()
-	}
-	i.key, i.value = i.Cursor.Seek(startKey)
-	return i.key != nil
-}
-
-func (i *iterator) Key() []byte {
-	return i.key
-}
-
-func (i *iterator) Value() []byte {
-	return i.value
-}
-
-func (i *iterator) Release() {
-	err := i.tx.Rollback()
-	if err != nil {
-		log.Errorf("commit err %v", err)
-	}
-}
-
 type write struct {
 	key      []byte
 	value    []byte
@@ -166,6 +163,10 @@ func (b *batch) Delete(key []byte) {
 		isDelete: true,
 	}
 	b.writes = append(b.writes, w)
+}
+
+func (b *batch) Len() int {
+	return len(b.writes)
 }
 
 // Driver implements engine Driver.

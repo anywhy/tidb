@@ -15,12 +15,11 @@ package types
 
 import (
 	"io"
-	"reflect"
 	"testing"
-	"time"
 
 	. "github.com/pingcap/check"
-	mysql "github.com/pingcap/tidb/mysqldef"
+	"github.com/pingcap/tidb/mysql"
+	"github.com/pingcap/tidb/util/testleak"
 )
 
 func TestT(t *testing.T) {
@@ -43,6 +42,7 @@ func testIsTypeChar(c *C, tp byte, expect bool) {
 }
 
 func (s *testTypeEtcSuite) TestIsType(c *C) {
+	defer testleak.AfterTest(c)()
 	testIsTypeBlob(c, mysql.TypeTinyBlob, true)
 	testIsTypeBlob(c, mysql.TypeMediumBlob, true)
 	testIsTypeBlob(c, mysql.TypeBlob, true)
@@ -65,6 +65,7 @@ func testTypeToStr(c *C, tp byte, charset string, expect string) {
 }
 
 func (s *testTypeEtcSuite) TestTypeToStr(c *C) {
+	defer testleak.AfterTest(c)()
 	testTypeStr(c, mysql.TypeYear, "year")
 	testTypeStr(c, 0xdd, "")
 
@@ -101,131 +102,13 @@ func (s *testTypeEtcSuite) TestTypeToStr(c *C) {
 }
 
 func (s *testTypeEtcSuite) TestEOFAsNil(c *C) {
+	defer testleak.AfterTest(c)()
 	err := EOFAsNil(io.EOF)
 	c.Assert(err, IsNil)
 }
 
-func checkCollate(c *C, x, y []interface{}, expect int) {
-	v := collate(x, y)
-	c.Assert(v, Equals, expect)
-}
-
-func checkCollateDesc(c *C, x, y []interface{}, expect int) {
-	v := collateDesc(x, y)
-	c.Assert(v, Equals, expect)
-}
-
-func (s *testTypeEtcSuite) TestCollate(c *C) {
-	checkCollate(c, []interface{}{1, 2}, nil, 1)
-	checkCollate(c, nil, []interface{}{1, 2}, -1)
-	checkCollate(c, nil, nil, 0)
-	checkCollate(c, []interface{}{1, 2}, []interface{}{3}, -1)
-	checkCollate(c, []interface{}{1, 2}, []interface{}{1, 2}, 0)
-	checkCollate(c, []interface{}{3, 2, 5}, []interface{}{3, 2}, 1)
-
-	checkCollateDesc(c, []interface{}{1, 2}, nil, -1)
-	checkCollateDesc(c, nil, []interface{}{1, 2}, 1)
-	checkCollateDesc(c, nil, nil, 0)
-	checkCollateDesc(c, []interface{}{1, 2}, []interface{}{3}, 1)
-	checkCollateDesc(c, []interface{}{1, 2}, []interface{}{1, 2}, 0)
-	checkCollateDesc(c, []interface{}{3, 2, 5}, []interface{}{3, 2}, -1)
-}
-
-func checkClone(c *C, a interface{}, pass bool) {
-	b, err := Clone(a)
-	if pass {
-		c.Assert(err, DeepEquals, nil)
-		c.Assert(a, DeepEquals, b)
-		return
-	}
-	c.Assert(err, NotNil)
-}
-
-func (s *testTypeEtcSuite) TestClone(c *C) {
-	checkClone(c, nil, true)
-	checkClone(c, uint16(111), true)
-	checkClone(c, "abcd1.c--/+!%^", true)
-	checkClone(c, []byte("aa028*(%^"), true)
-	checkClone(c, []interface{}{1, 2}, true)
-	checkClone(c, mysql.Duration{Duration: time.Duration(32), Fsp: 0}, true)
-	checkClone(c, mysql.Decimal{}, true)
-	checkClone(c, mysql.Time{Time: time.Now(), Type: 1, Fsp: 3}, true)
-	checkClone(c, make(map[int]string), false)
-	checkClone(c, mysql.Hex{Value: 1}, true)
-	checkClone(c, mysql.Bit{Value: 1, Width: 1}, true)
-	checkClone(c, mysql.Enum{Name: "a", Value: 1}, true)
-	checkClone(c, mysql.Set{Name: "a", Value: 1}, true)
-}
-
-func checkCoerce(c *C, a, b interface{}) {
-	a, b = Coerce(a, b)
-	var hasFloat, hasDecimal bool
-	switch x := a.(type) {
-	case int64:
-	case uint64:
-	case float64:
-		hasFloat = true
-	case mysql.Time:
-	case mysql.Duration:
-	case mysql.Decimal:
-		hasDecimal = true
-	default:
-		c.Error("unexpected type", reflect.TypeOf(x))
-	}
-	switch x := b.(type) {
-	case int64:
-	case uint64:
-	case float64:
-		hasFloat = true
-	case mysql.Time:
-	case mysql.Duration:
-	case mysql.Decimal:
-		hasDecimal = true
-	default:
-		c.Error("unexpected type", reflect.TypeOf(x))
-	}
-	if hasDecimal {
-		_, ok := a.(mysql.Decimal)
-		c.Assert(ok, IsTrue)
-		_, ok = b.(mysql.Decimal)
-		c.Assert(ok, IsTrue)
-	} else if hasFloat {
-		_, ok := a.(float64)
-		c.Assert(ok, IsTrue)
-		_, ok = b.(float64)
-		c.Assert(ok, IsTrue)
-	}
-}
-
-func (s *testTypeEtcSuite) TestCoerce(c *C) {
-	checkCoerce(c, uint64(3), int16(4))
-	checkCoerce(c, uint64(0xffffffffffffffff), float64(2.3))
-	checkCoerce(c, float64(1.3), uint64(0xffffffffffffffff))
-	checkCoerce(c, int64(11), float64(4.313))
-	checkCoerce(c, uint(2), uint16(52))
-	checkCoerce(c, uint8(8), true)
-	checkCoerce(c, uint32(62), int8(8))
-	checkCoerce(c, mysql.NewDecimalFromInt(1, 0), false)
-	checkCoerce(c, float32(3.4), mysql.NewDecimalFromUint(1, 0))
-	checkCoerce(c, int32(43), 3.235)
-}
-
-func (s *testTypeEtcSuite) TestIsOrderedType(c *C) {
-	r := IsOrderedType(1)
-	c.Assert(r, IsTrue)
-	r = IsOrderedType(-1)
-	c.Assert(r, IsTrue)
-	r = IsOrderedType(uint(1))
-	c.Assert(r, IsTrue)
-
-	r = IsOrderedType(mysql.Duration{Duration: time.Duration(0), Fsp: 0})
-	c.Assert(r, IsTrue)
-
-	r = IsOrderedType([]byte{1})
-	c.Assert(r, IsTrue)
-}
-
 func (s *testTypeEtcSuite) TestMaxFloat(c *C) {
+	defer testleak.AfterTest(c)()
 	tbl := []struct {
 		Flen    int
 		Decimal int
@@ -244,16 +127,19 @@ func (s *testTypeEtcSuite) TestMaxFloat(c *C) {
 }
 
 func (s *testTypeEtcSuite) TestRoundFloat(c *C) {
+	defer testleak.AfterTest(c)()
 	tbl := []struct {
 		Input  float64
 		Expect float64
 	}{
-		{2.5, 2},
+		{2.5, 3},
 		{1.5, 2},
-		{0.5, 0},
+		{0.5, 1},
+		{0.49999999999999997, 0},
 		{0, 0},
-		{-0.5, 0},
-		{-2.5, -2},
+		{-0.49999999999999997, 0},
+		{-0.5, -1},
+		{-2.5, -3},
 		{-1.5, -2},
 	}
 
@@ -263,7 +149,29 @@ func (s *testTypeEtcSuite) TestRoundFloat(c *C) {
 	}
 }
 
+func (s *testTypeEtcSuite) TestRound(c *C) {
+	defer testleak.AfterTest(c)()
+	tbl := []struct {
+		Input  float64
+		Dec    int
+		Expect float64
+	}{
+		{-1.23, 0, -1},
+		{-1.58, 0, -2},
+		{1.58, 0, 2},
+		{1.298, 1, 1.3},
+		{1.298, 0, 1},
+		{23.298, -1, 20},
+	}
+
+	for _, t := range tbl {
+		f := Round(t.Input, t.Dec)
+		c.Assert(f, Equals, t.Expect)
+	}
+}
+
 func (s *testTypeEtcSuite) TestTruncate(c *C) {
+	defer testleak.AfterTest(c)()
 	tbl := []struct {
 		Input   float64
 		Decimal int

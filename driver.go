@@ -23,19 +23,17 @@ import (
 	"database/sql"
 	"database/sql/driver"
 	"io"
-	"os"
+	"net/url"
 	"path/filepath"
 	"strings"
 	"sync"
 
 	"github.com/juju/errors"
-	"github.com/pingcap/tidb/kv"
+	"github.com/pingcap/tidb/ast"
 	"github.com/pingcap/tidb/model"
-	mysql "github.com/pingcap/tidb/mysqldef"
-	"github.com/pingcap/tidb/rset"
 	"github.com/pingcap/tidb/sessionctx"
-	qerror "github.com/pingcap/tidb/util/errors"
-	"github.com/pingcap/tidb/util/errors2"
+	"github.com/pingcap/tidb/terror"
+	"github.com/pingcap/tidb/util/types"
 )
 
 const (
@@ -54,7 +52,6 @@ var (
 	_ driver.Stmt   = (*driverStmt)(nil)
 	_ driver.Driver = (*sqlDriver)(nil)
 
-	// TODO: change to BEGIN or START TRANSACTION
 	txBeginSQL    = "BEGIN;"
 	txCommitSQL   = "COMMIT;"
 	txRollbackSQL = "ROLLBACK;"
@@ -63,6 +60,15 @@ var (
 )
 
 type errList []error
+
+type driverParams struct {
+	storePath string
+	dbName    string
+	// when set to true `mysql.Time` isn't encoded as string but passed as `time.Time`
+	// this option is named for compatibility the same as in the mysql driver
+	// while we actually do not have additional parsing to do
+	parseTime bool
+}
 
 func (e *errList) append(err error) {
 	if err != nil {
@@ -125,32 +131,63 @@ func (d *sqlDriver) unlock() {
 	d.mu.Unlock()
 }
 
-// Open returns a new connection to the database.  The name is a string in a
-// driver-specific format.
+// parseDriverDSN cuts off DB name from dsn. It returns error if the dsn is not
+// valid.
+func parseDriverDSN(dsn string) (params *driverParams, err error) {
+	u, err := url.Parse(dsn)
+	if err != nil {
+		return nil, errors.Trace(err)
+	}
+	path := filepath.Join(u.Host, u.Path)
+	dbName := filepath.Clean(filepath.Base(path))
+	if dbName == "" || dbName == "." || dbName == string(filepath.Separator) {
+		return nil, errors.Errorf("invalid DB name %q", dbName)
+	}
+	// cut off dbName
+	path = filepath.Clean(filepath.Dir(path))
+	if path == "" || path == "." || path == string(filepath.Separator) {
+		return nil, errors.Errorf("invalid dsn %q", dsn)
+	}
+	u.Path, u.Host = path, ""
+	params = &driverParams{
+		storePath: u.String(),
+		dbName:    dbName,
+	}
+	// parse additional driver params
+	query := u.Query()
+	if parseTime := query.Get("parseTime"); parseTime == "true" {
+		params.parseTime = true
+	}
+
+	return params, nil
+}
+
+// Open returns a new connection to the database.
+//
+// The dsn must be a URL format 'engine://path/dbname?params'.
+// Engine is the storage name registered with RegisterStore.
+// Path is the storage specific format.
+// Params is key-value pairs split by '&', optional params are storage specific.
+// Examples:
+//    goleveldb://relative/path/test
+//    boltdb:///absolute/path/test
 //
 // Open may return a cached connection (one previously closed), but doing so is
 // unnecessary; the sql package maintains a pool of idle connections for
 // efficient re-use.
 //
+// The behavior of the mysql driver regarding time parsing can also be imitated
+// by passing ?parseTime
+//
 // The returned connection is only used by one goroutine at a time.
-func (d *sqlDriver) Open(dataSource string) (driver.Conn, error) {
-	// Split the dataSource to uri and dbName
-	i := strings.LastIndex(dataSource, "/")
-	if i == -1 {
-		return nil, errors.Errorf("Invalid dataSource: %q", dataSource)
-	}
-	uri := dataSource[:i]
-	dbName := dataSource[i+1:]
-
-	store, err := NewStore(uri)
+func (d *sqlDriver) Open(dsn string) (driver.Conn, error) {
+	params, err := parseDriverDSN(dsn)
 	if err != nil {
 		return nil, errors.Trace(err)
 	}
-
-	driver := &sqlDriver{}
-	dbName = filepath.Clean(dbName)
-	if dbName == "" || dbName == "." || dbName == string(os.PathSeparator) {
-		return nil, errors.Errorf("invalid DB name %q", dbName)
+	store, err := NewStore(params.storePath)
+	if err != nil {
+		return nil, errors.Trace(err)
 	}
 
 	sess, err := CreateSession(store)
@@ -162,15 +199,20 @@ func (d *sqlDriver) Open(dataSource string) (driver.Conn, error) {
 	d.lock()
 	defer d.unlock()
 
-	DBName := model.NewCIStr(dbName)
+	DBName := model.NewCIStr(params.dbName)
 	domain := sessionctx.GetDomain(s)
+	cs := &ast.CharsetOpt{
+		Chs: "utf8",
+		Col: "utf8_bin",
+	}
 	if !domain.InfoSchema().SchemaExists(DBName) {
-		err = domain.DDL().CreateSchema(s, DBName)
+		err = domain.DDL().CreateSchema(s, DBName, cs)
 		if err != nil {
 			return nil, errors.Trace(err)
 		}
 	}
-	return newDriverConn(s, driver, DBName.O)
+	driver := &sqlDriver{}
+	return newDriverConn(s, driver, DBName.O, params)
 }
 
 // driverConn is a connection to a database. It is not used concurrently by
@@ -181,13 +223,15 @@ type driverConn struct {
 	s      Session
 	driver *sqlDriver
 	stmts  map[string]driver.Stmt
+	params *driverParams
 }
 
-func newDriverConn(sess *session, d *sqlDriver, schema string) (driver.Conn, error) {
+func newDriverConn(sess *session, d *sqlDriver, schema string, params *driverParams) (driver.Conn, error) {
 	r := &driverConn{
 		driver: d,
 		stmts:  map[string]driver.Stmt{},
 		s:      sess,
+		params: params,
 	}
 
 	_, err := r.s.Execute("use " + schema)
@@ -248,24 +292,21 @@ func (c *driverConn) Begin() (driver.Tx, error) {
 
 func (c *driverConn) Commit() error {
 	if c.s == nil {
-		return qerror.ErrCommitNotInTransaction
+		return terror.CommitNotInTransaction
 	}
 	_, err := c.s.Execute(txCommitSQL)
-
-	if errors2.ErrorEqual(err, kv.ErrConditionNotMatch) {
-		return c.s.Retry()
-	}
 
 	if err != nil {
 		return errors.Trace(err)
 	}
 
-	return errors.Trace(c.s.FinishTxn(false))
+	err = c.s.CommitTxn()
+	return errors.Trace(err)
 }
 
 func (c *driverConn) Rollback() error {
 	if c.s == nil {
-		return errors.Trace(qerror.ErrRollbackNotInTransaction)
+		return terror.RollbackNotInTransaction
 	}
 
 	if _, err := c.s.Execute(txRollbackSQL); err != nil {
@@ -332,7 +373,7 @@ func (c *driverConn) driverQuery(query string, args []driver.Value) (driver.Rows
 		if len(rss) == 0 {
 			return nil, errors.Trace(errNoResult)
 		}
-		return &driverRows{rs: rss[0]}, nil
+		return &driverRows{params: c.params, rs: rss[0]}, nil
 	}
 	stmt, err := c.getStmt(query)
 	if err != nil {
@@ -360,7 +401,8 @@ func (r *driverResult) RowsAffected() (int64, error) {
 
 // driverRows is an iterator over an executed query's results.
 type driverRows struct {
-	rs rset.Recordset
+	rs     ast.RecordSet
+	params *driverParams
 }
 
 // Columns returns the names of the columns. The number of columns of the
@@ -373,7 +415,7 @@ func (r *driverRows) Columns() []string {
 	fs, _ := r.rs.Fields()
 	names := make([]string, len(fs))
 	for i, f := range fs {
-		names[i] = f.Name
+		names[i] = f.ColumnAsName.O
 	}
 	return names
 }
@@ -408,43 +450,42 @@ func (r *driverRows) Next(dest []driver.Value) error {
 		return errors.Errorf("field count mismatch: got %d, need %d", len(row.Data), len(dest))
 	}
 	for i, xi := range row.Data {
-		switch v := xi.(type) {
-		case nil, int64, float32, float64, bool, []byte, string:
-			dest[i] = v
-		case int8:
-			dest[i] = int64(v)
-		case int16:
-			dest[i] = int64(v)
-		case int32:
-			dest[i] = int64(v)
-		case int:
-			dest[i] = int64(v)
-		case uint8:
-			dest[i] = uint64(v)
-		case uint16:
-			dest[i] = uint64(v)
-		case uint32:
-			dest[i] = uint64(v)
-		case uint64:
-			dest[i] = uint64(v)
-		case uint:
-			dest[i] = uint64(v)
-		case mysql.Duration:
-			dest[i] = v.String()
-		case mysql.Time:
-			dest[i] = v.String()
-		case mysql.Decimal:
-			dest[i] = v.String()
-		case mysql.Hex:
-			dest[i] = v.ToString()
-		case mysql.Bit:
-			dest[i] = v.ToString()
-		case mysql.Enum:
-			dest[i] = v.String()
-		case mysql.Set:
-			dest[i] = v.String()
+		switch xi.Kind() {
+		case types.KindNull:
+			dest[i] = nil
+		case types.KindInt64:
+			dest[i] = xi.GetInt64()
+		case types.KindUint64:
+			dest[i] = xi.GetUint64()
+		case types.KindFloat32:
+			dest[i] = xi.GetFloat32()
+		case types.KindFloat64:
+			dest[i] = xi.GetFloat64()
+		case types.KindString:
+			dest[i] = xi.GetString()
+		case types.KindBytes:
+			dest[i] = xi.GetBytes()
+		case types.KindMysqlBit:
+			dest[i] = xi.GetMysqlBit().ToString()
+		case types.KindMysqlDecimal:
+			dest[i] = xi.GetMysqlDecimal().String()
+		case types.KindMysqlDuration:
+			dest[i] = xi.GetMysqlDuration().String()
+		case types.KindMysqlEnum:
+			dest[i] = xi.GetMysqlEnum().String()
+		case types.KindMysqlHex:
+			dest[i] = xi.GetMysqlHex().ToString()
+		case types.KindMysqlSet:
+			dest[i] = xi.GetMysqlSet().String()
+		case types.KindMysqlTime:
+			t := xi.GetMysqlTime()
+			if !r.params.parseTime {
+				dest[i] = t.String()
+			} else {
+				dest[i] = t.Time
+			}
 		default:
-			return errors.Errorf("unable to handle type %T", xi)
+			return errors.Errorf("unable to handle type %T", xi.GetValue())
 		}
 	}
 	return nil
@@ -452,7 +493,6 @@ func (r *driverRows) Next(dest []driver.Value) error {
 
 // driverStmt is a prepared statement. It is bound to a driverConn and not used
 // by multiple goroutines concurrently.
-// TODO: We do not support prepared stmt now, will change this later
 type driverStmt struct {
 	conn       *driverConn
 	query      string
@@ -511,7 +551,7 @@ func (s *driverStmt) Query(args []driver.Value) (driver.Rows, error) {
 		// The statement is not a query.
 		return &driverRows{}, nil
 	}
-	return &driverRows{rs: rs}, nil
+	return &driverRows{params: s.conn.params, rs: rs}, nil
 }
 
 func init() {
