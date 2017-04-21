@@ -1,10 +1,10 @@
 package localstore
 
 import (
-	"io"
-
+	"github.com/juju/errors"
 	"github.com/pingcap/tidb/kv"
 	"github.com/pingcap/tipb/go-tipb"
+	goctx "golang.org/x/net/context"
 )
 
 type dbClient struct {
@@ -12,7 +12,7 @@ type dbClient struct {
 	regionInfo []*regionInfo
 }
 
-func (c *dbClient) Send(req *kv.Request) kv.Response {
+func (c *dbClient) Send(ctx goctx.Context, req *kv.Request) kv.Response {
 	it := &response{
 		client:      c,
 		concurrency: req.Concurrency,
@@ -37,17 +37,12 @@ func (c *dbClient) Send(req *kv.Request) kv.Response {
 
 func (c *dbClient) SupportRequestType(reqType, subType int64) bool {
 	switch reqType {
-	case kv.ReqTypeSelect:
+	case kv.ReqTypeSelect, kv.ReqTypeIndex:
 		switch subType {
-		case kv.ReqSubTypeGroupBy:
+		case kv.ReqSubTypeGroupBy, kv.ReqSubTypeBasic, kv.ReqSubTypeTopN:
 			return true
 		default:
 			return supportExpr(tipb.ExprType(subType))
-		}
-	case kv.ReqTypeIndex:
-		switch subType {
-		case kv.ReqSubTypeDesc, kv.ReqSubTypeBasic:
-			return true
 		}
 	}
 	return false
@@ -55,20 +50,36 @@ func (c *dbClient) SupportRequestType(reqType, subType int64) bool {
 
 func supportExpr(exprType tipb.ExprType) bool {
 	switch exprType {
-	case tipb.ExprType_Null, tipb.ExprType_Int64, tipb.ExprType_Uint64, tipb.ExprType_Float32,
-		tipb.ExprType_Float64, tipb.ExprType_String, tipb.ExprType_Bytes,
-		tipb.ExprType_MysqlDuration, tipb.ExprType_MysqlDecimal,
-		tipb.ExprType_ColumnRef,
-		tipb.ExprType_And, tipb.ExprType_Or,
-		tipb.ExprType_LT, tipb.ExprType_LE, tipb.ExprType_EQ, tipb.ExprType_NE,
+	// data type.
+	case tipb.ExprType_Null, tipb.ExprType_Int64, tipb.ExprType_Uint64,
+		tipb.ExprType_Float32, tipb.ExprType_Float64, tipb.ExprType_String,
+		tipb.ExprType_Bytes, tipb.ExprType_MysqlDuration, tipb.ExprType_MysqlDecimal,
+		tipb.ExprType_MysqlTime, tipb.ExprType_ColumnRef:
+		return true
+	// logic operators.
+	case tipb.ExprType_And, tipb.ExprType_Or, tipb.ExprType_Not, tipb.ExprType_Xor:
+		return true
+	// compare operators.
+	case tipb.ExprType_LT, tipb.ExprType_LE, tipb.ExprType_EQ, tipb.ExprType_NE,
 		tipb.ExprType_GE, tipb.ExprType_GT, tipb.ExprType_NullEQ,
-		tipb.ExprType_In, tipb.ExprType_ValueList,
-		tipb.ExprType_Not,
-		tipb.ExprType_Like:
+		tipb.ExprType_In, tipb.ExprType_ValueList, tipb.ExprType_Like:
 		return true
-	case tipb.ExprType_Plus, tipb.ExprType_Div:
+	// arithmetic operators.
+	case tipb.ExprType_Plus, tipb.ExprType_Div, tipb.ExprType_Minus,
+		tipb.ExprType_Mul, tipb.ExprType_IntDiv, tipb.ExprType_Mod:
 		return true
-	case tipb.ExprType_Count, tipb.ExprType_First:
+	// aggregate functions.
+	case tipb.ExprType_Count, tipb.ExprType_First, tipb.ExprType_Sum,
+		tipb.ExprType_Avg, tipb.ExprType_Max, tipb.ExprType_Min:
+		return true
+	// bitwise operators.
+	case tipb.ExprType_BitAnd, tipb.ExprType_BitOr, tipb.ExprType_BitXor, tipb.ExprType_BitNeg:
+		return true
+	// control functions
+	case tipb.ExprType_Case, tipb.ExprType_If, tipb.ExprType_IfNull, tipb.ExprType_NullIf:
+		return true
+	// other functions
+	case tipb.ExprType_Coalesce, tipb.ExprType_IsNull:
 		return true
 	case kv.ReqSubTypeDesc:
 		return true
@@ -79,28 +90,6 @@ func supportExpr(exprType tipb.ExprType) bool {
 
 func (c *dbClient) updateRegionInfo() {
 	c.regionInfo = c.store.pd.GetRegionInfo()
-}
-
-type localResponseReader struct {
-	s []byte
-	i int64
-}
-
-func (r *localResponseReader) Read(b []byte) (n int, err error) {
-	if len(b) == 0 {
-		return 0, nil
-	}
-	if r.i >= int64(len(r.s)) {
-		return 0, io.EOF
-	}
-	n = copy(b, r.s[r.i:])
-	r.i += int64(n)
-	return
-}
-
-func (r *localResponseReader) Close() error {
-	r.i = int64(len(r.s))
-	return nil
 }
 
 type response struct {
@@ -121,7 +110,7 @@ type task struct {
 	region  *localRegion
 }
 
-func (it *response) Next() (resp io.ReadCloser, err error) {
+func (it *response) Next() (resp []byte, err error) {
 	if it.finished {
 		return nil, nil
 	}
@@ -132,7 +121,7 @@ func (it *response) Next() (resp io.ReadCloser, err error) {
 	}
 	if err != nil {
 		it.Close()
-		return nil, err
+		return nil, errors.Trace(err)
 	}
 	if len(regionResp.newStartKey) != 0 {
 		it.client.updateRegionInfo()
@@ -147,7 +136,7 @@ func (it *response) Next() (resp io.ReadCloser, err error) {
 	if it.reqSent == len(it.tasks) && it.respGot == it.reqSent {
 		it.Close()
 	}
-	return &localResponseReader{s: regionResp.data}, nil
+	return regionResp.data, nil
 }
 
 func (it *response) createRetryTasks(resp *regionResponse) []*task {
@@ -178,6 +167,7 @@ func buildRegionTasks(client *dbClient, req *kv.Request) (tasks []*task) {
 				startKey: info.startKey,
 				endKey:   info.endKey,
 				data:     req.Data,
+				ranges:   req.KeyRanges,
 			}
 			task := &task{
 				region:  info.rs,

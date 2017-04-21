@@ -14,6 +14,7 @@
 package terror
 
 import (
+	"encoding/json"
 	"fmt"
 	"runtime"
 	"strconv"
@@ -23,13 +24,9 @@ import (
 	"github.com/pingcap/tidb/mysql"
 )
 
-// Common base error instances.
+// Global error instances.
 var (
-	CommitNotInTransaction   = ClassExecutor.New(CodeCommitNotInTransaction, "commit not in transaction")
-	RollbackNotInTransaction = ClassExecutor.New(CodeRollbackNotInTransaction, "rollback not in transaction")
-	ExecResultIsEmpty        = ClassExecutor.New(CodeExecResultIsEmpty, "exec result is empty")
-
-	MissConnectionID = ClassExpression.New(CodeMissConnectionID, "miss connection id information")
+	ErrCritical = ClassGlobal.New(CodeExecResultIsEmpty, "critical error %v")
 )
 
 // ErrCode represents a specific error type in a error class.
@@ -38,9 +35,8 @@ type ErrCode int
 
 // Executor error codes.
 const (
-	CodeCommitNotInTransaction   ErrCode = 1
-	CodeRollbackNotInTransaction         = 2
-	CodeExecResultIsEmpty                = 3
+	CodeUnknown           ErrCode = -1
+	CodeExecResultIsEmpty         = 3
 )
 
 // Expression error codes.
@@ -73,6 +69,9 @@ const (
 	ClassVariable
 	ClassXEval
 	ClassTable
+	ClassTypes
+	ClassGlobal
+	ClassMockTikv
 	// Add more as needed.
 )
 
@@ -113,6 +112,12 @@ func (ec ErrClass) String() string {
 		return "variable"
 	case ClassTable:
 		return "table"
+	case ClassTypes:
+		return "types"
+	case ClassGlobal:
+		return "global"
+	case ClassMockTikv:
+		return "mocktikv"
 	}
 	return strconv.Itoa(int(ec))
 }
@@ -150,6 +155,7 @@ type Error struct {
 	class   ErrClass
 	code    ErrCode
 	message string
+	args    []interface{}
 	file    string
 	line    int
 }
@@ -164,6 +170,37 @@ func (e *Error) Code() ErrCode {
 	return e.code
 }
 
+// MarshalJSON implements json.Marshaler interface.
+func (e *Error) MarshalJSON() ([]byte, error) {
+	return json.Marshal(&struct {
+		Class ErrClass `json:"class"`
+		Code  ErrCode  `json:"code"`
+		Msg   string   `json:"message"`
+	}{
+		Class: e.class,
+		Code:  e.code,
+		Msg:   e.getMsg(),
+	})
+}
+
+// UnmarshalJSON implements json.Unmarshaler interface.
+func (e *Error) UnmarshalJSON(data []byte) error {
+	err := &struct {
+		Class ErrClass `json:"class"`
+		Code  ErrCode  `json:"code"`
+		Msg   string   `json:"message"`
+	}{}
+
+	if err := json.Unmarshal(data, &err); err != nil {
+		return errors.Trace(err)
+	}
+
+	e.class = err.Class
+	e.code = err.Code
+	e.message = err.Msg
+	return nil
+}
+
 // Location returns the location where the error is created,
 // implements juju/errors locationer interface.
 func (e *Error) Location() (file string, line int) {
@@ -172,14 +209,39 @@ func (e *Error) Location() (file string, line int) {
 
 // Error implements error interface.
 func (e *Error) Error() string {
-	return fmt.Sprintf("[%s:%d]%s", e.class, e.code, e.message)
+	return fmt.Sprintf("[%s:%d]%s", e.class, e.code, e.getMsg())
+}
+
+func (e *Error) getMsg() string {
+	if len(e.args) > 0 {
+		return fmt.Sprintf(e.message, e.args...)
+	}
+	return e.message
 }
 
 // Gen generates a new *Error with the same class and code, and a new formatted message.
 func (e *Error) Gen(format string, args ...interface{}) *Error {
 	err := *e
-	err.message = fmt.Sprintf(format, args...)
+	err.message = format
+	err.args = args
 	_, err.file, err.line, _ = runtime.Caller(1)
+	return &err
+}
+
+// GenByArgs generates a new *Error with the same class and code, and new arguments.
+func (e *Error) GenByArgs(args ...interface{}) *Error {
+	err := *e
+	err.args = args
+	_, err.file, err.line, _ = runtime.Caller(1)
+	return &err
+}
+
+// FastGen generates a new *Error with the same class and code, and a new formatted message.
+// This will not call runtime.Caller to get file and line.
+func (e *Error) FastGen(format string, args ...interface{}) *Error {
+	err := *e
+	err.message = format
+	err.args = args
 	return &err
 }
 
@@ -201,7 +263,7 @@ func (e *Error) NotEqual(err error) bool {
 // ToSQLError convert Error to mysql.SQLError.
 func (e *Error) ToSQLError() *mysql.SQLError {
 	code := e.getMySQLErrorCode()
-	return mysql.NewErrf(code, e.message)
+	return mysql.NewErrf(code, e.getMsg())
 }
 
 var defaultMySQLErrorCode uint16

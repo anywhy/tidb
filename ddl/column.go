@@ -14,16 +14,21 @@
 package ddl
 
 import (
+	"time"
+
 	"github.com/juju/errors"
 	"github.com/ngaut/log"
 	"github.com/pingcap/tidb/ast"
+	"github.com/pingcap/tidb/context"
 	"github.com/pingcap/tidb/infoschema"
 	"github.com/pingcap/tidb/kv"
 	"github.com/pingcap/tidb/meta"
 	"github.com/pingcap/tidb/model"
+	"github.com/pingcap/tidb/mysql"
 	"github.com/pingcap/tidb/table"
-	"github.com/pingcap/tidb/table/tables"
+	"github.com/pingcap/tidb/tablecodec"
 	"github.com/pingcap/tidb/terror"
+	"github.com/pingcap/tidb/util/types"
 )
 
 func (d *ddl) adjustColumnOffset(columns []*model.ColumnInfo, indices []*model.IndexInfo, offset int, added bool) {
@@ -42,7 +47,7 @@ func (d *ddl) adjustColumnOffset(columns []*model.ColumnInfo, indices []*model.I
 		columns[offset].Offset = len(columns) - 1
 	}
 
-	// TODO: index can't cover the add/remove column with offset now, we may check this later.
+	// TODO: Index can't cover the add/remove column with offset now, we may check this later.
 
 	// Update index column offset info.
 	for _, idx := range indices {
@@ -55,7 +60,7 @@ func (d *ddl) adjustColumnOffset(columns []*model.ColumnInfo, indices []*model.I
 	}
 }
 
-func (d *ddl) addColumn(tblInfo *model.TableInfo, colInfo *model.ColumnInfo, pos *ast.ColumnPosition) (*model.ColumnInfo, int, error) {
+func (d *ddl) createColumnInfo(tblInfo *model.TableInfo, colInfo *model.ColumnInfo, pos *ast.ColumnPosition) (*model.ColumnInfo, int, error) {
 	// Check column name duplicate.
 	cols := tblInfo.Columns
 	position := len(cols)
@@ -66,13 +71,13 @@ func (d *ddl) addColumn(tblInfo *model.TableInfo, colInfo *model.ColumnInfo, pos
 	} else if pos.Tp == ast.ColumnPositionAfter {
 		c := findCol(cols, pos.RelativeColumn.Name.L)
 		if c == nil {
-			return nil, 0, infoschema.ErrColumnNotExists.Gen("no such column: %v", pos.RelativeColumn)
+			return nil, 0, infoschema.ErrColumnNotExists.GenByArgs(pos.RelativeColumn, tblInfo.Name)
 		}
 
 		// Insert position is after the mentioned column.
 		position = c.Offset + 1
 	}
-
+	colInfo.ID = allocateColumnID(tblInfo)
 	colInfo.State = model.StateNone
 	// To support add column asynchronous, we should mark its offset as the last column.
 	// So that we can use origin column offset to get value from row.
@@ -90,7 +95,7 @@ func (d *ddl) addColumn(tblInfo *model.TableInfo, colInfo *model.ColumnInfo, pos
 
 func (d *ddl) onAddColumn(t *meta.Meta, job *model.Job) error {
 	schemaID := job.SchemaID
-	tblInfo, err := d.getTableInfo(t, job)
+	tblInfo, err := getTableInfo(t, job, schemaID)
 	if err != nil {
 		return errors.Trace(err)
 	}
@@ -107,97 +112,75 @@ func (d *ddl) onAddColumn(t *meta.Meta, job *model.Job) error {
 	columnInfo := findCol(tblInfo.Columns, col.Name.L)
 	if columnInfo != nil {
 		if columnInfo.State == model.StatePublic {
-			// we already have a column with same column name
+			// We already have a column with the same column name.
 			job.State = model.JobCancelled
-			return infoschema.ErrColumnExists.Gen("ADD COLUMN: column already exist %s", col.Name.L)
+			return infoschema.ErrColumnExists.GenByArgs(col.Name)
 		}
 	} else {
-		columnInfo, offset, err = d.addColumn(tblInfo, col, pos)
+		columnInfo, offset, err = d.createColumnInfo(tblInfo, col, pos)
 		if err != nil {
 			job.State = model.JobCancelled
 			return errors.Trace(err)
 		}
-
 		// Set offset arg to job.
 		if offset != 0 {
 			job.Args = []interface{}{columnInfo, pos, offset}
 		}
 	}
 
-	_, err = t.GenSchemaVersion()
-	if err != nil {
-		return errors.Trace(err)
-	}
-
+	originalState := columnInfo.State
 	switch columnInfo.State {
 	case model.StateNone:
 		// none -> delete only
 		job.SchemaState = model.StateDeleteOnly
 		columnInfo.State = model.StateDeleteOnly
-		err = t.UpdateTable(schemaID, tblInfo)
-		return errors.Trace(err)
+		_, err = updateTableInfo(t, job, tblInfo, originalState)
 	case model.StateDeleteOnly:
 		// delete only -> write only
 		job.SchemaState = model.StateWriteOnly
 		columnInfo.State = model.StateWriteOnly
-		err = t.UpdateTable(schemaID, tblInfo)
-		return errors.Trace(err)
+		_, err = updateTableInfo(t, job, tblInfo, originalState)
 	case model.StateWriteOnly:
 		// write only -> reorganization
 		job.SchemaState = model.StateWriteReorganization
 		columnInfo.State = model.StateWriteReorganization
-		// initialize SnapshotVer to 0 for later reorganization check.
+		// Initialize SnapshotVer to 0 for later reorganization check.
 		job.SnapshotVer = 0
-		err = t.UpdateTable(schemaID, tblInfo)
-		return errors.Trace(err)
+		_, err = updateTableInfo(t, job, tblInfo, originalState)
 	case model.StateWriteReorganization:
 		// reorganization -> public
-		// get the current version for reorganization if we don't have
+		// Get the current version for reorganization if we don't have it.
 		reorgInfo, err := d.getReorgInfo(t, job)
 		if err != nil || reorgInfo.first {
-			// if we run reorg firstly, we should update the job snapshot version
+			// If we run reorg firstly, we should update the job snapshot version
 			// and then run the reorg next time.
-			return errors.Trace(err)
-		}
-
-		tbl, err := d.getTable(schemaID, tblInfo)
-		if err != nil {
-			return errors.Trace(err)
-		}
-
-		err = d.runReorgJob(func() error {
-			return d.backfillColumn(tbl, columnInfo, reorgInfo)
-		})
-
-		if terror.ErrorEqual(err, errWaitReorgTimeout) {
-			// if timeout, we should return, check for the owner and re-wait job done.
-			return nil
-		}
-		if err != nil {
 			return errors.Trace(err)
 		}
 
 		// Adjust column offset.
 		d.adjustColumnOffset(tblInfo.Columns, tblInfo.Indices, offset, true)
-
 		columnInfo.State = model.StatePublic
-
-		if err = t.UpdateTable(schemaID, tblInfo); err != nil {
+		job.SchemaState = model.StatePublic
+		ver, err := updateTableInfo(t, job, tblInfo, originalState)
+		if err != nil {
 			return errors.Trace(err)
 		}
 
-		// finish this job
-		job.SchemaState = model.StatePublic
+		// Finish this job.
 		job.State = model.JobDone
-		return nil
+		job.BinlogInfo.AddTableInfo(ver, tblInfo)
+
+		d.asyncNotifyEvent(&Event{Tp: model.ActionAddColumn, TableInfo: tblInfo, ColumnInfo: columnInfo})
 	default:
-		return ErrInvalidColumnState.Gen("invalid column state %v", columnInfo.State)
+		err = ErrInvalidColumnState.Gen("invalid column state %v", columnInfo.State)
 	}
+
+	return errors.Trace(err)
 }
 
 func (d *ddl) onDropColumn(t *meta.Meta, job *model.Job) error {
 	schemaID := job.SchemaID
-	tblInfo, err := d.getTableInfo(t, job)
+	tblInfo, err := getTableInfo(t, job, schemaID)
 	if err != nil {
 		return errors.Trace(err)
 	}
@@ -212,7 +195,7 @@ func (d *ddl) onDropColumn(t *meta.Meta, job *model.Job) error {
 	colInfo := findCol(tblInfo.Columns, colName.L)
 	if colInfo == nil {
 		job.State = model.JobCancelled
-		return infoschema.ErrColumnNotExists.Gen("column %s doesn't exist", colName)
+		return ErrCantDropFieldOrKey.Gen("column %s doesn't exist", colName)
 	}
 
 	if len(tblInfo.Columns) == 1 {
@@ -221,75 +204,43 @@ func (d *ddl) onDropColumn(t *meta.Meta, job *model.Job) error {
 			colName, tblInfo.Name)
 	}
 
-	// we don't support drop column with index covered now.
-	// we must drop the index first, then drop the column.
-	for _, indexInfo := range tblInfo.Indices {
-		for _, col := range indexInfo.Columns {
-			if col.Name.L == colName.L {
-				job.State = model.JobCancelled
-				return errCantDropColWithIndex.Gen("can't drop column %s with index %s covered now",
-					colName, indexInfo.Name)
-			}
-		}
+	// We don't support dropping column with index covered now.
+	if isColumnWithIndex(colName.L, tblInfo.Indices) {
+		job.State = model.JobCancelled
+		return errCantDropColWithIndex.Gen("can't drop column %s with index covered now", colName)
 	}
 
-	_, err = t.GenSchemaVersion()
-	if err != nil {
-		return errors.Trace(err)
-	}
-
+	originalState := colInfo.State
 	switch colInfo.State {
 	case model.StatePublic:
 		// public -> write only
 		job.SchemaState = model.StateWriteOnly
 		colInfo.State = model.StateWriteOnly
-
-		// set this column's offset to the last and reset all following columns' offset
+		// Set this column's offset to the last and reset all following columns' offsets.
 		d.adjustColumnOffset(tblInfo.Columns, tblInfo.Indices, colInfo.Offset, false)
-
-		err = t.UpdateTable(schemaID, tblInfo)
-		return errors.Trace(err)
+		_, err = updateTableInfo(t, job, tblInfo, originalState)
 	case model.StateWriteOnly:
 		// write only -> delete only
 		job.SchemaState = model.StateDeleteOnly
 		colInfo.State = model.StateDeleteOnly
-		err = t.UpdateTable(schemaID, tblInfo)
-		return errors.Trace(err)
+		_, err = updateTableInfo(t, job, tblInfo, originalState)
 	case model.StateDeleteOnly:
 		// delete only -> reorganization
 		job.SchemaState = model.StateDeleteReorganization
 		colInfo.State = model.StateDeleteReorganization
-		// initialize SnapshotVer to 0 for later reorganization check.
+		// Initialize SnapshotVer to 0 for later reorganization check.
 		job.SnapshotVer = 0
-		err = t.UpdateTable(schemaID, tblInfo)
-		return errors.Trace(err)
+		_, err = updateTableInfo(t, job, tblInfo, originalState)
 	case model.StateDeleteReorganization:
 		// reorganization -> absent
 		reorgInfo, err := d.getReorgInfo(t, job)
 		if err != nil || reorgInfo.first {
-			// if we run reorg firstly, we should update the job snapshot version
+			// If we run reorg firstly, we should update the job snapshot version
 			// and then run the reorg next time.
 			return errors.Trace(err)
 		}
 
-		tbl, err := d.getTable(schemaID, tblInfo)
-		if err != nil {
-			return errors.Trace(err)
-		}
-
-		err = d.runReorgJob(func() error {
-			return d.dropTableColumn(tbl, colInfo, reorgInfo)
-		})
-
-		if terror.ErrorEqual(err, errWaitReorgTimeout) {
-			// if timeout, we should return, check for the owner and re-wait job done.
-			return nil
-		}
-		if err != nil {
-			return errors.Trace(err)
-		}
-
-		// all reorganization jobs done, drop this column
+		// All reorganization jobs are done, drop this column.
 		newColumns := make([]*model.ColumnInfo, 0, len(tblInfo.Columns))
 		for _, col := range tblInfo.Columns {
 			if col.Name.L != colName.L {
@@ -297,136 +248,230 @@ func (d *ddl) onDropColumn(t *meta.Meta, job *model.Job) error {
 			}
 		}
 		tblInfo.Columns = newColumns
-		if err = t.UpdateTable(schemaID, tblInfo); err != nil {
+		job.SchemaState = model.StateNone
+		ver, err := updateTableInfo(t, job, tblInfo, originalState)
+		if err != nil {
 			return errors.Trace(err)
 		}
 
-		// finish this job
-		job.SchemaState = model.StateNone
+		// Finish this job.
 		job.State = model.JobDone
-		return nil
+		job.BinlogInfo.AddTableInfo(ver, tblInfo)
+
+		d.asyncNotifyEvent(&Event{Tp: model.ActionDropColumn, TableInfo: tblInfo, ColumnInfo: colInfo})
 	default:
-		return ErrInvalidTableState.Gen("invalid table state %v", tblInfo.State)
+		err = ErrInvalidTableState.Gen("invalid table state %v", tblInfo.State)
 	}
+	return errors.Trace(err)
 }
 
+// TODO: Use it when updating the column type or remove it.
 // How to backfill column data in reorganization state?
 //  1. Generate a snapshot with special version.
 //  2. Traverse the snapshot, get every row in the table.
 //  3. For one row, if the row has been already deleted, skip to next row.
 //  4. If not deleted, check whether column data has existed, if existed, skip to next row.
 //  5. If column data doesn't exist, backfill the column with default value and then continue to handle next row.
-func (d *ddl) backfillColumn(t table.Table, columnInfo *model.ColumnInfo, reorgInfo *reorgInfo) error {
+func (d *ddl) addTableColumn(t table.Table, columnInfo *model.ColumnInfo, reorgInfo *reorgInfo, job *model.Job) error {
 	seekHandle := reorgInfo.Handle
 	version := reorgInfo.SnapshotVer
+	count := job.GetRowCount()
+	ctx := d.newContext()
+
+	colMeta := &columnMeta{
+		colID:     columnInfo.ID,
+		oldColMap: make(map[int64]*types.FieldType)}
+	handles := make([]int64, 0, defaultBatchCnt)
+	// Get column default value.
+	var err error
+	if columnInfo.DefaultValue != nil {
+		colMeta.defaultVal, err = table.GetColDefaultValue(ctx, columnInfo)
+		if err != nil {
+			job.State = model.JobCancelled
+			log.Errorf("[ddl] fatal: this case shouldn't happen, column %v err %v", columnInfo, err)
+			return errors.Trace(err)
+		}
+	} else if mysql.HasNotNullFlag(columnInfo.Flag) {
+		colMeta.defaultVal = table.GetZeroValue(columnInfo)
+	}
+	for _, col := range t.Meta().Columns {
+		colMeta.oldColMap[col.ID] = &col.FieldType
+	}
 
 	for {
-		handles, err := d.getSnapshotRows(t, version, seekHandle)
+		startTime := time.Now()
+		handles = handles[:0]
+		err = d.iterateSnapshotRows(t, version, seekHandle,
+			func(h int64, rowKey kv.Key, rawRecord []byte) (bool, error) {
+				handles = append(handles, h)
+				if len(handles) == defaultBatchCnt {
+					return false, nil
+				}
+				return true, nil
+			})
 		if err != nil {
 			return errors.Trace(err)
 		} else if len(handles) == 0 {
 			return nil
 		}
 
+		count += int64(len(handles))
 		seekHandle = handles[len(handles)-1] + 1
-		err = d.backfillColumnData(t, columnInfo, handles, reorgInfo)
+		sub := time.Since(startTime).Seconds()
+		err = d.backfillColumn(ctx, t, colMeta, handles, reorgInfo)
 		if err != nil {
+			log.Warnf("[ddl] added column for %v rows failed, take time %v", count, sub)
 			return errors.Trace(err)
 		}
+
+		d.setReorgRowCount(count)
+		batchHandleDataHistogram.WithLabelValues(batchAddCol).Observe(sub)
+		log.Infof("[ddl] added column for %v rows, take time %v", count, sub)
 	}
 }
 
-func (d *ddl) backfillColumnData(t table.Table, columnInfo *model.ColumnInfo, handles []int64, reorgInfo *reorgInfo) error {
+// backfillColumnInTxn deals with a part of backfilling column data in a Transaction.
+// This part of the column data rows is defaultSmallBatchCnt.
+func (d *ddl) backfillColumnInTxn(t table.Table, colMeta *columnMeta, handles []int64, txn kv.Transaction) (int64, error) {
+	nextHandle := handles[0]
 	for _, handle := range handles {
-		log.Info("[ddl] backfill column...", handle)
+		log.Debug("[ddl] backfill column...", handle)
+		rowKey := t.RecordKey(handle)
+		rowVal, err := txn.Get(rowKey)
+		if err != nil {
+			if terror.ErrorEqual(err, kv.ErrNotExist) {
+				// If row doesn't exist, skip it.
+				continue
+			}
+			return 0, errors.Trace(err)
+		}
+
+		rowColumns, err := tablecodec.DecodeRow(rowVal, colMeta.oldColMap)
+		if err != nil {
+			return 0, errors.Trace(err)
+		}
+		if _, ok := rowColumns[colMeta.colID]; ok {
+			// The column is already added by update or insert statement, skip it.
+			continue
+		}
+
+		newColumnIDs := make([]int64, 0, len(rowColumns)+1)
+		newRow := make([]types.Datum, 0, len(rowColumns)+1)
+		for colID, val := range rowColumns {
+			newColumnIDs = append(newColumnIDs, colID)
+			newRow = append(newRow, val)
+		}
+		newColumnIDs = append(newColumnIDs, colMeta.colID)
+		newRow = append(newRow, colMeta.defaultVal)
+		newRowVal, err := tablecodec.EncodeRow(newRow, newColumnIDs)
+		if err != nil {
+			return 0, errors.Trace(err)
+		}
+		err = txn.Set(rowKey, newRowVal)
+		if err != nil {
+			return 0, errors.Trace(err)
+		}
+	}
+
+	return nextHandle, nil
+}
+
+type columnMeta struct {
+	colID      int64
+	defaultVal types.Datum
+	oldColMap  map[int64]*types.FieldType
+}
+
+func (d *ddl) backfillColumn(ctx context.Context, t table.Table, colMeta *columnMeta, handles []int64, reorgInfo *reorgInfo) error {
+	var endIdx int
+	for len(handles) > 0 {
+		if len(handles) >= defaultSmallBatchCnt {
+			endIdx = defaultSmallBatchCnt
+		} else {
+			endIdx = len(handles)
+		}
 
 		err := kv.RunInNewTxn(d.store, true, func(txn kv.Transaction) error {
-			if err := d.isReorgRunnable(txn); err != nil {
+			if err := d.isReorgRunnable(txn, ddlJobFlag); err != nil {
 				return errors.Trace(err)
 			}
 
-			// First check if row exists.
-			exist, err := checkRowExist(txn, t, handle)
-			if err != nil {
-				return errors.Trace(err)
-			} else if !exist {
-				// If row doesn't exist, skip it.
-				return nil
+			nextHandle, err1 := d.backfillColumnInTxn(t, colMeta, handles[:endIdx], txn)
+			if err1 != nil {
+				return errors.Trace(err1)
 			}
-
-			backfillKey := t.RecordKey(handle, &table.Column{ColumnInfo: *columnInfo})
-			backfillValue, err := txn.Get(backfillKey)
-			if err != nil && !kv.IsErrNotFound(err) {
-				return errors.Trace(err)
-			}
-			if backfillValue != nil {
-				return nil
-			}
-
-			value, _, err := table.GetColDefaultValue(nil, columnInfo)
-			if err != nil {
-				return errors.Trace(err)
-			}
-
-			// must convert to the column field type.
-			v, err := value.ConvertTo(&columnInfo.FieldType)
-			if err != nil {
-				return errors.Trace(err)
-			}
-
-			err = lockRow(txn, t, handle)
-			if err != nil {
-				return errors.Trace(err)
-			}
-
-			err = tables.SetColValue(txn, backfillKey, v)
-			if err != nil {
-				return errors.Trace(err)
-			}
-
-			return errors.Trace(reorgInfo.UpdateHandle(txn, handle))
+			return errors.Trace(reorgInfo.UpdateHandle(txn, nextHandle))
 		})
 
 		if err != nil {
 			return errors.Trace(err)
 		}
+		handles = handles[endIdx:]
 	}
 
 	return nil
 }
 
-func (d *ddl) dropTableColumn(t table.Table, colInfo *model.ColumnInfo, reorgInfo *reorgInfo) error {
-	version := reorgInfo.SnapshotVer
-	seekHandle := reorgInfo.Handle
+func (d *ddl) onSetDefaultValue(t *meta.Meta, job *model.Job) error {
+	newCol := &model.ColumnInfo{}
+	err := job.DecodeArgs(newCol)
+	if err != nil {
+		job.State = model.JobCancelled
+		return errors.Trace(err)
+	}
 
-	col := &table.Column{ColumnInfo: *colInfo}
-	for {
-		handles, err := d.getSnapshotRows(t, version, seekHandle)
-		if err != nil {
-			return errors.Trace(err)
-		} else if len(handles) == 0 {
-			return nil
-		}
+	return errors.Trace(d.updateColumn(t, job, newCol, &newCol.Name))
+}
 
-		seekHandle = handles[len(handles)-1] + 1
+func (d *ddl) onModifyColumn(t *meta.Meta, job *model.Job) error {
+	newCol := &model.ColumnInfo{}
+	oldColName := &model.CIStr{}
+	err := job.DecodeArgs(newCol, oldColName)
+	if err != nil {
+		job.State = model.JobCancelled
+		return errors.Trace(err)
+	}
 
-		err = kv.RunInNewTxn(d.store, true, func(txn kv.Transaction) error {
-			if err1 := d.isReorgRunnable(txn); err1 != nil {
-				return errors.Trace(err1)
+	return errors.Trace(d.updateColumn(t, job, newCol, oldColName))
+}
+
+func (d *ddl) updateColumn(t *meta.Meta, job *model.Job, newCol *model.ColumnInfo, oldColName *model.CIStr) error {
+	tblInfo, err := getTableInfo(t, job, job.SchemaID)
+	if err != nil {
+		return errors.Trace(err)
+	}
+	oldCol := findCol(tblInfo.Columns, oldColName.L)
+	if oldCol == nil || oldCol.State != model.StatePublic {
+		job.State = model.JobCancelled
+		return infoschema.ErrColumnNotExists.GenByArgs(newCol.Name, tblInfo.Name)
+	}
+	*oldCol = *newCol
+
+	originalState := job.SchemaState
+	job.SchemaState = model.StatePublic
+	ver, err := updateTableInfo(t, job, tblInfo, originalState)
+	if err != nil {
+		job.State = model.JobCancelled
+		return errors.Trace(err)
+	}
+
+	job.State = model.JobDone
+	job.BinlogInfo.AddTableInfo(ver, tblInfo)
+	return nil
+}
+
+func isColumnWithIndex(colName string, indices []*model.IndexInfo) bool {
+	for _, indexInfo := range indices {
+		for _, col := range indexInfo.Columns {
+			if col.Name.L == colName {
+				return true
 			}
-
-			var h int64
-			for _, h = range handles {
-				key := t.RecordKey(h, col)
-				err1 := txn.Delete(key)
-				if err1 != nil && !terror.ErrorEqual(err1, kv.ErrNotExist) {
-					return errors.Trace(err1)
-				}
-			}
-			return errors.Trace(reorgInfo.UpdateHandle(txn, h))
-		})
-		if err != nil {
-			return errors.Trace(err)
 		}
 	}
+	return false
+}
+
+func allocateColumnID(tblInfo *model.TableInfo) int64 {
+	tblInfo.MaxColumnID++
+	return tblInfo.MaxColumnID
 }

@@ -1,4 +1,4 @@
-// Copyright 2016 PingCAP, Inc.
+// Copyright 2017 PingCAP, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,96 +15,282 @@ package mocktikv
 
 import (
 	"bytes"
-	"encoding/binary"
 
 	"github.com/golang/protobuf/proto"
 	"github.com/juju/errors"
 	"github.com/pingcap/kvproto/pkg/coprocessor"
+	"github.com/pingcap/kvproto/pkg/kvrpcpb"
+	"github.com/pingcap/tidb/distsql"
+	"github.com/pingcap/tidb/expression"
 	"github.com/pingcap/tidb/kv"
 	"github.com/pingcap/tidb/mysql"
-	"github.com/pingcap/tidb/terror"
-	"github.com/pingcap/tidb/util/codec"
+	"github.com/pingcap/tidb/sessionctx/variable"
+	"github.com/pingcap/tidb/tablecodec"
 	"github.com/pingcap/tidb/util/types"
-	"github.com/pingcap/tidb/xapi/tablecodec"
-	"github.com/pingcap/tidb/xapi/xeval"
 	"github.com/pingcap/tipb/go-tipb"
 )
 
-type selectContext struct {
-	sel          *tipb.SelectRequest
-	eval         *xeval.Evaluator
-	whereColumns map[int64]*tipb.ColumnInfo
+type dagContext struct {
+	dagReq    *tipb.DAGRequest
+	keyRanges []*coprocessor.KeyRange
+	evalCtx   *evalContext
 }
 
-func (h *rpcHandler) handleCopRequest(req *coprocessor.Request) (*coprocessor.Response, error) {
+func (h *rpcHandler) handleCopDAGRequest(req *coprocessor.Request) (*coprocessor.Response, error) {
 	resp := &coprocessor.Response{}
+	if len(req.Ranges) == 0 {
+		return resp, nil
+	}
+	if req.GetTp() != kv.ReqTypeDAG {
+		return resp, nil
+	}
 	if err := h.checkContext(req.GetContext()); err != nil {
 		resp.RegionError = err
 		return resp, nil
 	}
-	if len(req.Ranges) == 0 {
-		return resp, nil
+
+	dagReq := new(tipb.DAGRequest)
+	err := proto.Unmarshal(req.Data, dagReq)
+	if err != nil {
+		return nil, errors.Trace(err)
 	}
-	if req.GetTp() == kv.ReqTypeSelect || req.GetTp() == kv.ReqTypeIndex {
-		sel := new(tipb.SelectRequest)
-		err := proto.Unmarshal(req.Data, sel)
-		if err != nil {
-			return nil, errors.Trace(err)
-		}
-		ctx := &selectContext{
-			sel: sel,
-		}
-		if sel.Where != nil {
-			ctx.eval = &xeval.Evaluator{Row: make(map[int64]types.Datum)}
-			ctx.whereColumns = make(map[int64]*tipb.ColumnInfo)
-			collectColumnsInWhere(sel.Where, ctx)
-		}
-		var rows []*tipb.Row
-		if req.GetTp() == kv.ReqTypeSelect {
-			rows, err = h.getRowsFromSelectReq(ctx)
-		} else {
-			rows, err = h.getRowsFromIndexReq(ctx)
-		}
-		selResp := new(tipb.SelectResponse)
-		selResp.Error = toPBError(err)
-		selResp.Rows = rows
-		if err != nil {
-			resp.OtherError = proto.String(err.Error())
-		}
-		data, err := proto.Marshal(selResp)
-		if err != nil {
-			return nil, errors.Trace(err)
-		}
-		resp.Data = data
+	sc := flagsToStatementContext(dagReq.Flags)
+	ctx := &dagContext{
+		dagReq:    dagReq,
+		keyRanges: req.Ranges,
+		evalCtx:   &evalContext{sc: sc},
 	}
-	return resp, nil
+	e, err := h.buildDAG(ctx, dagReq.Executors)
+	if err != nil {
+		return nil, errors.Trace(err)
+	}
+	data := make([]byte, 0)
+	var (
+		handle int64
+		row    [][]byte
+		chunks []tipb.Chunk
+	)
+	for {
+		handle, row, err = e.Next()
+		if err != nil {
+			// Wrap this error into response.
+			break
+		}
+		if row == nil {
+			break
+		}
+		data = data[:0]
+		for _, val := range row {
+			data = append(data, val...)
+		}
+		chunks = appendRow(chunks, handle, data)
+	}
+	return buildResp(chunks, err)
 }
 
-func collectColumnsInWhere(expr *tipb.Expr, ctx *selectContext) error {
-	if expr == nil {
-		return nil
+func (h *rpcHandler) buildExec(ctx *dagContext, curr *tipb.Executor) (executor, error) {
+	var currExec executor
+	var err error
+	switch curr.GetTp() {
+	case tipb.ExecType_TypeTableScan:
+		currExec = h.buildTableScan(ctx, curr)
+	case tipb.ExecType_TypeIndexScan:
+		currExec = h.buildIndexScan(ctx, curr)
+	case tipb.ExecType_TypeSelection:
+		currExec, err = h.buildSelection(ctx, curr)
+	case tipb.ExecType_TypeAggregation:
+		currExec, err = h.buildAggregation(ctx, curr)
+	case tipb.ExecType_TypeTopN:
+		currExec, err = h.buildTopN(ctx, curr)
+	case tipb.ExecType_TypeLimit:
+		currExec = &limitExec{limit: curr.Limit.GetLimit()}
+	default:
+		// TODO: Support other types.
+		err = errors.Errorf("this exec type %v doesn't support yet.", curr.GetTp())
 	}
-	if expr.GetTp() == tipb.ExprType_ColumnRef {
-		_, i, err := codec.DecodeInt(expr.Val)
+
+	return currExec, errors.Trace(err)
+}
+
+func (h *rpcHandler) buildDAG(ctx *dagContext, executors []*tipb.Executor) (executor, error) {
+	var src executor
+	for i := 0; i < len(executors); i++ {
+		curr, err := h.buildExec(ctx, executors[i])
 		if err != nil {
-			return errors.Trace(err)
+			return nil, errors.Trace(err)
 		}
-		var columns []*tipb.ColumnInfo
-		if ctx.sel.TableInfo != nil {
-			columns = ctx.sel.TableInfo.Columns
-		} else {
-			columns = ctx.sel.IndexInfo.Columns
-		}
-		for _, c := range columns {
-			if c.GetColumnId() == i {
-				ctx.whereColumns[i] = c
-				return nil
-			}
-		}
-		return xeval.ErrInvalid.Gen("column %d not found", i)
+		curr.SetSrcExec(src)
+		src = curr
 	}
-	for _, child := range expr.Children {
-		err := collectColumnsInWhere(child, ctx)
+	return src, nil
+}
+
+func (h *rpcHandler) buildTableScan(ctx *dagContext, executor *tipb.Executor) *tableScanExec {
+	columns := executor.TblScan.Columns
+	ctx.evalCtx.setColumnInfo(columns)
+	ranges := h.extractKVRanges(ctx.keyRanges, *executor.TblScan.Desc)
+
+	return &tableScanExec{
+		TableScan:   executor.TblScan,
+		kvRanges:    ranges,
+		colIDs:      ctx.evalCtx.colIDs,
+		startTS:     ctx.dagReq.GetStartTs(),
+		mvccStore:   h.mvccStore,
+		rawStartKey: h.rawStartKey,
+		rawEndKey:   h.rawEndKey,
+	}
+}
+
+func (h *rpcHandler) buildIndexScan(ctx *dagContext, executor *tipb.Executor) *indexScanExec {
+	columns := executor.IdxScan.Columns
+	ctx.evalCtx.setColumnInfo(columns)
+	length := len(columns)
+	// The PKHandle column info has been collected in ctx.
+	if columns[length-1].GetPkHandle() {
+		columns = columns[:length-1]
+	}
+	ranges := h.extractKVRanges(ctx.keyRanges, *executor.IdxScan.Desc)
+
+	return &indexScanExec{
+		IndexScan:   executor.IdxScan,
+		kvRanges:    ranges,
+		colsLen:     len(columns),
+		startTS:     ctx.dagReq.GetStartTs(),
+		mvccStore:   h.mvccStore,
+		rawStartKey: h.rawStartKey,
+		rawEndKey:   h.rawEndKey,
+	}
+}
+
+func (h *rpcHandler) buildSelection(ctx *dagContext, executor *tipb.Executor) (*selectionExec, error) {
+	var err error
+	var relatedColOffsets []int
+	pbConds := executor.Selection.Conditions
+	for _, cond := range pbConds {
+		relatedColOffsets, err = extractOffsetsInExpr(cond, ctx.evalCtx.columnInfos, relatedColOffsets)
+		if err != nil {
+			return nil, errors.Trace(err)
+		}
+	}
+	conds, err := convertToExprs(ctx.evalCtx.sc, ctx.evalCtx.colIDs, pbConds)
+	if err != nil {
+		return nil, errors.Trace(err)
+	}
+
+	return &selectionExec{
+		evalCtx:           ctx.evalCtx,
+		relatedColOffsets: relatedColOffsets,
+		conditions:        conds,
+		row:               make([]types.Datum, len(ctx.evalCtx.columnInfos)),
+	}, nil
+}
+
+func (h *rpcHandler) buildAggregation(ctx *dagContext, executor *tipb.Executor) (*aggregateExec, error) {
+	length := len(executor.Aggregation.AggFunc)
+	aggs := make([]expression.AggregationFunction, 0, length)
+	var err error
+	var relatedColOffsets []int
+	for _, expr := range executor.Aggregation.AggFunc {
+		aggExpr, err := expression.NewDistAggFunc(expr, ctx.evalCtx.colIDs, ctx.evalCtx.sc)
+		if err != nil {
+			return nil, errors.Trace(err)
+		}
+		aggs = append(aggs, aggExpr)
+		relatedColOffsets, err = extractOffsetsInExpr(expr, ctx.evalCtx.columnInfos, relatedColOffsets)
+		if err != nil {
+			return nil, errors.Trace(err)
+		}
+	}
+	for _, item := range executor.Aggregation.GroupBy {
+		relatedColOffsets, err = extractOffsetsInExpr(item, ctx.evalCtx.columnInfos, relatedColOffsets)
+		if err != nil {
+			return nil, errors.Trace(err)
+		}
+	}
+	groupBys, err := convertToExprs(ctx.evalCtx.sc, ctx.evalCtx.colIDs, executor.Aggregation.GetGroupBy())
+	if err != nil {
+		return nil, errors.Trace(err)
+	}
+
+	return &aggregateExec{
+		evalCtx:           ctx.evalCtx,
+		aggExprs:          aggs,
+		groupByExprs:      groupBys,
+		groups:            make(map[string]struct{}),
+		groupKeys:         make([][]byte, 0),
+		relatedColOffsets: relatedColOffsets,
+		row:               make([]types.Datum, len(ctx.evalCtx.columnInfos)),
+	}, nil
+}
+
+func (h *rpcHandler) buildTopN(ctx *dagContext, executor *tipb.Executor) (*topNExec, error) {
+	topN := executor.TopN
+	var err error
+	var relatedColOffsets []int
+	pbConds := make([]*tipb.Expr, len(topN.OrderBy))
+	for i, item := range topN.OrderBy {
+		relatedColOffsets, err = extractOffsetsInExpr(item.Expr, ctx.evalCtx.columnInfos, relatedColOffsets)
+		if err != nil {
+			return nil, errors.Trace(err)
+		}
+		pbConds[i] = item.Expr
+	}
+	heap := &topnHeap{
+		totalCount: int(*topN.Limit),
+		topnSorter: topnSorter{
+			orderByItems: topN.OrderBy,
+			sc:           ctx.evalCtx.sc,
+		},
+	}
+
+	conds, err := convertToExprs(ctx.evalCtx.sc, ctx.evalCtx.colIDs, pbConds)
+	if err != nil {
+		return nil, errors.Trace(err)
+	}
+
+	return &topNExec{
+		heap:              heap,
+		evalCtx:           ctx.evalCtx,
+		relatedColOffsets: relatedColOffsets,
+		orderByExprs:      conds,
+		row:               make([]types.Datum, len(ctx.evalCtx.columnInfos)),
+	}, nil
+}
+
+type evalContext struct {
+	colIDs      map[int64]int
+	columnInfos []*tipb.ColumnInfo
+	fieldTps    []*types.FieldType
+	sc          *variable.StatementContext
+}
+
+func (e *evalContext) setColumnInfo(cols []*tipb.ColumnInfo) {
+	e.columnInfos = make([]*tipb.ColumnInfo, len(cols))
+	copy(e.columnInfos, cols)
+
+	e.colIDs = make(map[int64]int)
+	e.fieldTps = make([]*types.FieldType, 0, len(e.columnInfos))
+	for i, col := range e.columnInfos {
+		ft := distsql.FieldTypeFromPBColumn(col)
+		e.fieldTps = append(e.fieldTps, ft)
+		e.colIDs[col.GetColumnId()] = i
+	}
+}
+
+// decodeRelatedColumnVals decodes data to Datum slice according to the row information.
+func (e *evalContext) decodeRelatedColumnVals(relatedColOffsets []int, handle int64, value [][]byte, row []types.Datum) error {
+	var err error
+	for _, offset := range relatedColOffsets {
+		col := e.columnInfos[offset]
+		if col.GetPkHandle() {
+			if mysql.HasUnsignedFlag(uint(col.GetFlag())) {
+				row[offset] = types.NewUintDatum(uint64(handle))
+			} else {
+				row[offset] = types.NewIntDatum(handle)
+			}
+			continue
+		}
+		row[offset], err = tablecodec.DecodeColumnValue(value[offset], e.fieldTps[offset])
 		if err != nil {
 			return errors.Trace(err)
 		}
@@ -112,385 +298,42 @@ func collectColumnsInWhere(expr *tipb.Expr, ctx *selectContext) error {
 	return nil
 }
 
-func toPBError(err error) *tipb.Error {
-	if err == nil {
-		return nil
+func buildResp(chunks []tipb.Chunk, err error) (*coprocessor.Response, error) {
+	resp := &coprocessor.Response{}
+	selResp := &tipb.SelectResponse{
+		Error:  toPBError(err),
+		Chunks: chunks,
 	}
-	perr := new(tipb.Error)
-	code := int32(1)
-	perr.Code = &code
-	errStr := err.Error()
-	perr.Msg = &errStr
-	return perr
-}
-
-func (h *rpcHandler) getRowsFromSelectReq(ctx *selectContext) ([]*tipb.Row, error) {
-	kvRanges, desc := h.extractKVRanges(ctx.sel)
-	var rows []*tipb.Row
-	limit := int64(-1)
-	if ctx.sel.Limit != nil {
-		limit = ctx.sel.GetLimit()
-	}
-	for _, ran := range kvRanges {
-		if limit == 0 {
-			break
-		}
-		ranRows, err := h.getRowsFromRange(ctx, ran, limit, desc)
-		if err != nil {
-			return nil, errors.Trace(err)
-		}
-		rows = append(rows, ranRows...)
-		limit -= int64(len(ranRows))
-	}
-	return rows, nil
-}
-
-// extractKVRanges extracts kv.KeyRanges slice from a SelectRequest, and also returns if it is in descending order.
-func (h *rpcHandler) extractKVRanges(sel *tipb.SelectRequest) (kvRanges []kv.KeyRange, desc bool) {
-	var (
-		tid   int64
-		idxID int64
-	)
-	if sel.IndexInfo != nil {
-		tid = sel.IndexInfo.GetTableId()
-		idxID = sel.IndexInfo.GetIndexId()
-	} else {
-		tid = sel.TableInfo.GetTableId()
-	}
-	for _, kran := range sel.Ranges {
-		var upperKey, lowerKey kv.Key
-		if idxID == 0 {
-			upperKey = tablecodec.EncodeRowKey(tid, kran.GetHigh())
-			if bytes.Compare(upperKey, h.startKey) <= 0 {
-				continue
+	if err != nil {
+		if locked, ok := errors.Cause(err).(*ErrLocked); ok {
+			resp.Locked = &kvrpcpb.LockInfo{
+				Key:         locked.Key,
+				PrimaryLock: locked.Primary,
+				LockVersion: locked.StartTS,
+				LockTtl:     locked.TTL,
 			}
-			lowerKey = tablecodec.EncodeRowKey(tid, kran.GetLow())
 		} else {
-			upperKey = tablecodec.EncodeIndexSeekKey(tid, idxID, kran.GetHigh())
-			if bytes.Compare(upperKey, h.startKey) <= 0 {
-				continue
-			}
-			lowerKey = tablecodec.EncodeIndexSeekKey(tid, idxID, kran.GetLow())
-		}
-		if len(h.endKey) != 0 && bytes.Compare([]byte(lowerKey), h.endKey) >= 0 {
-			break
-		}
-		var kvr kv.KeyRange
-		kvr.StartKey = kv.Key(maxStartKey(lowerKey, h.startKey))
-		kvr.EndKey = kv.Key(minEndKey(upperKey, h.endKey))
-		kvRanges = append(kvRanges, kvr)
-	}
-	if sel.OrderBy != nil {
-		desc = *sel.OrderBy[0].Desc
-	}
-	if desc {
-		reverseKVRanges(kvRanges)
-	}
-	return
-}
-
-func reverseKVRanges(kvRanges []kv.KeyRange) {
-	for i := 0; i < len(kvRanges)/2; i++ {
-		j := len(kvRanges) - i - 1
-		kvRanges[i], kvRanges[j] = kvRanges[j], kvRanges[i]
-	}
-}
-
-func (h *rpcHandler) getRowsFromRange(ctx *selectContext, ran kv.KeyRange, limit int64, desc bool) ([]*tipb.Row, error) {
-	startKey := maxStartKey(ran.StartKey, h.startKey)
-	endKey := minEndKey(ran.EndKey, h.endKey)
-	if limit == 0 || bytes.Compare(startKey, endKey) >= 0 {
-		return nil, nil
-	}
-	var rows []*tipb.Row
-	if ran.IsPoint() {
-		val, err := h.mvccStore.Get(startKey, ctx.sel.GetStartTs())
-		if len(val) == 0 {
-			return nil, nil
-		} else if err != nil {
-			return nil, errors.Trace(err)
-		}
-		handle, err := tablecodec.DecodeRowKey(kv.Key(startKey))
-		if err != nil {
-			return nil, errors.Trace(err)
-		}
-		match, err := h.evalWhereForRow(ctx, handle)
-		if err != nil {
-			return nil, errors.Trace(err)
-		}
-		if !match {
-			return nil, nil
-		}
-		row, err := h.getRowByHandle(ctx, handle)
-		if err != nil {
-			return nil, errors.Trace(err)
-		}
-		if row != nil {
-			rows = append(rows, row)
-		}
-		return rows, nil
-	}
-	var seekKey []byte
-	if desc {
-		seekKey = endKey
-	} else {
-		seekKey = startKey
-	}
-	for {
-		if limit == 0 {
-			break
-		}
-		var (
-			pairs []Pair
-			pair  Pair
-			err   error
-		)
-		if desc {
-			pairs = h.mvccStore.ReverseScan(startKey, seekKey, 1, ctx.sel.GetStartTs())
-		} else {
-			pairs = h.mvccStore.Scan(seekKey, endKey, 1, ctx.sel.GetStartTs())
-		}
-		if len(pairs) > 0 {
-			pair = pairs[0]
-		}
-		if pair.Err != nil {
-			// TODO: handle lock error.
-			return nil, errors.Trace(pair.Err)
-		}
-		if pair.Key == nil {
-			break
-		}
-		if desc {
-			if bytes.Compare(pair.Key, startKey) < 0 {
-				break
-			}
-			seekKey = []byte(tablecodec.TruncateToRowKeyLen(kv.Key(pair.Key)))
-		} else {
-			if bytes.Compare(pair.Key, endKey) >= 0 {
-				break
-			}
-			seekKey = []byte(kv.Key(pair.Key).PrefixNext())
-		}
-		handle, err := tablecodec.DecodeRowKey(pair.Key)
-		if err != nil {
-			return nil, errors.Trace(err)
-		}
-		match, err := h.evalWhereForRow(ctx, handle)
-		if err != nil {
-			return nil, errors.Trace(err)
-		}
-		if !match {
-			continue
-		}
-		row, err := h.getRowByHandle(ctx, handle)
-		if err != nil {
-			return nil, errors.Trace(err)
-		}
-		if row != nil {
-			rows = append(rows, row)
-			limit--
+			resp.OtherError = err.Error()
 		}
 	}
-	return rows, nil
-}
-
-func (h *rpcHandler) getRowByHandle(ctx *selectContext, handle int64) (*tipb.Row, error) {
-	tid := ctx.sel.TableInfo.GetTableId()
-	columns := ctx.sel.TableInfo.Columns
-	row := new(tipb.Row)
-	var d types.Datum
-	d.SetInt64(handle)
-	var err error
-	row.Handle, err = codec.EncodeValue(nil, d)
+	data, err := proto.Marshal(selResp)
 	if err != nil {
 		return nil, errors.Trace(err)
 	}
-	for _, col := range columns {
-		if col.GetPkHandle() {
-			if mysql.HasUnsignedFlag(uint(col.GetFlag())) {
-				row.Data, err = codec.EncodeValue(row.Data, types.NewUintDatum(uint64(handle)))
-				if err != nil {
-					return nil, errors.Trace(err)
-				}
-			} else {
-				row.Data = append(row.Data, row.Handle...)
-			}
-		} else {
-			colID := col.GetColumnId()
-			if ctx.whereColumns[colID] != nil {
-				// The column is saved in evaluator, use it directly.
-				datum := ctx.eval.Row[colID]
-				row.Data, err = codec.EncodeValue(row.Data, datum)
-				if err != nil {
-					return nil, errors.Trace(err)
-				}
-			} else {
-				key := tablecodec.EncodeColumnKey(tid, handle, colID)
-				data, err1 := h.mvccStore.Get(key, ctx.sel.GetStartTs())
-				if err1 != nil {
-					return nil, errors.Trace(err1)
-				}
-				if data == nil {
-					if mysql.HasNotNullFlag(uint(col.GetFlag())) {
-						return nil, errors.Trace(kv.ErrNotExist)
-					}
-					row.Data = append(row.Data, codec.NilFlag)
-				} else {
-					row.Data = append(row.Data, data...)
-				}
-			}
-		}
-	}
-	return row, nil
+	resp.Data = data
+	return resp, nil
 }
 
-func (h *rpcHandler) evalWhereForRow(ctx *selectContext, handle int64) (bool, error) {
-	if ctx.sel.Where == nil {
-		return true, nil
-	}
-	tid := ctx.sel.TableInfo.GetTableId()
-	for colID, col := range ctx.whereColumns {
-		if col.GetPkHandle() {
-			if mysql.HasUnsignedFlag(uint(col.GetFlag())) {
-				ctx.eval.Row[colID] = types.NewUintDatum(uint64(handle))
-			} else {
-				ctx.eval.Row[colID] = types.NewIntDatum(handle)
-			}
-		} else {
-			key := tablecodec.EncodeColumnKey(tid, handle, colID)
-			data, err := h.mvccStore.Get(key, ctx.sel.GetStartTs())
-			if err != nil {
-				return false, errors.Trace(err)
-			}
-			if data == nil {
-				if mysql.HasNotNullFlag(uint(col.GetFlag())) {
-					return false, errors.Trace(kv.ErrNotExist)
-				}
-				ctx.eval.Row[colID] = types.Datum{}
-			} else {
-				var d types.Datum
-				d, err = tablecodec.DecodeColumnValue(data, col)
-				if err != nil {
-					return false, errors.Trace(err)
-				}
-				ctx.eval.Row[colID] = d
-			}
-		}
-	}
-	result, err := ctx.eval.Eval(ctx.sel.Where)
-	if err != nil {
-		return false, errors.Trace(err)
-	}
-	if result.IsNull() {
-		return false, nil
-	}
-	boolResult, err := result.ToBool()
-	if err != nil {
-		return false, errors.Trace(err)
-	}
-	return boolResult == 1, nil
-}
+const rowsPerChunk = 64
 
-func (h *rpcHandler) getRowsFromIndexReq(ctx *selectContext) ([]*tipb.Row, error) {
-	kvRanges, desc := h.extractKVRanges(ctx.sel)
-	var rows []*tipb.Row
-	limit := int64(-1)
-	if ctx.sel.Limit != nil {
-		limit = ctx.sel.GetLimit()
+func appendRow(chunks []tipb.Chunk, handle int64, data []byte) []tipb.Chunk {
+	if len(chunks) == 0 || len(chunks[len(chunks)-1].RowsMeta) >= rowsPerChunk {
+		chunks = append(chunks, tipb.Chunk{})
 	}
-	for _, ran := range kvRanges {
-		if limit == 0 {
-			break
-		}
-		ranRows, err := h.getIndexRowFromRange(ctx.sel, ran, desc, limit)
-		if err != nil {
-			return nil, errors.Trace(err)
-		}
-		rows = append(rows, ranRows...)
-		limit -= int64(len(ranRows))
-	}
-	return rows, nil
-}
-
-func (h *rpcHandler) getIndexRowFromRange(sel *tipb.SelectRequest, ran kv.KeyRange, desc bool, limit int64) ([]*tipb.Row, error) {
-	startKey := maxStartKey(ran.StartKey, h.startKey)
-	endKey := minEndKey(ran.EndKey, h.endKey)
-	if limit == 0 || bytes.Compare(startKey, endKey) >= 0 {
-		return nil, nil
-	}
-	var rows []*tipb.Row
-	var seekKey kv.Key
-	if desc {
-		seekKey = endKey
-	} else {
-		seekKey = startKey
-	}
-	for {
-		if limit == 0 {
-			break
-		}
-		var (
-			pairs []Pair
-			pair  Pair
-			err   error
-		)
-		if desc {
-			pairs = h.mvccStore.ReverseScan(startKey, seekKey, 1, sel.GetStartTs())
-		} else {
-			pairs = h.mvccStore.Scan(seekKey, endKey, 1, sel.GetStartTs())
-		}
-		if len(pairs) > 0 {
-			pair = pairs[0]
-		}
-		if pair.Err != nil {
-			// TODO: handle lock error.
-			return nil, errors.Trace(pair.Err)
-		}
-		if pair.Key == nil {
-			break
-		}
-		if desc {
-			if bytes.Compare(pair.Key, startKey) < 0 {
-				break
-			}
-			seekKey = pair.Key
-		} else {
-			if bytes.Compare(pair.Key, endKey) >= 0 {
-				break
-			}
-			seekKey = []byte(kv.Key(pair.Key).PrefixNext())
-		}
-
-		datums, err := tablecodec.DecodeIndexKey(pair.Key)
-		if err != nil {
-			return nil, errors.Trace(err)
-		}
-		var handle types.Datum
-		columns := sel.IndexInfo.Columns
-		if len(datums) > len(columns) {
-			handle = datums[len(columns)]
-			datums = datums[:len(columns)]
-		} else {
-			var intHandle int64
-			intHandle, err = decodeHandle(pair.Value)
-			if err != nil {
-				return nil, errors.Trace(err)
-			}
-			handle.SetInt64(intHandle)
-		}
-		data, err := codec.EncodeValue(nil, datums...)
-		if err != nil {
-			return nil, errors.Trace(err)
-		}
-		handleData, err := codec.EncodeValue(nil, handle)
-		if err != nil {
-			return nil, errors.Trace(err)
-		}
-		row := &tipb.Row{Handle: handleData, Data: data}
-		rows = append(rows, row)
-		limit--
-	}
-	return rows, nil
+	cur := &chunks[len(chunks)-1]
+	cur.RowsMeta = append(cur.RowsMeta, tipb.RowMeta{Handle: handle, Length: int64(len(data))})
+	cur.RowsData = append(cur.RowsData, data...)
+	return chunks
 }
 
 func maxStartKey(rangeStartKey kv.Key, regionStartKey []byte) []byte {
@@ -507,13 +350,73 @@ func minEndKey(rangeEndKey kv.Key, regionEndKey []byte) []byte {
 	return regionEndKey
 }
 
-func decodeHandle(data []byte) (int64, error) {
-	var h int64
-	buf := bytes.NewBuffer(data)
-	err := binary.Read(buf, binary.BigEndian, &h)
-	return h, errors.Trace(err)
+func toPBError(err error) *tipb.Error {
+	if err == nil {
+		return nil
+	}
+	perr := new(tipb.Error)
+	perr.Code = int32(1)
+	errStr := err.Error()
+	perr.Msg = errStr
+	return perr
 }
 
-func isDefaultNull(err error, col *tipb.ColumnInfo) bool {
-	return terror.ErrorEqual(err, kv.ErrNotExist) && !mysql.HasNotNullFlag(uint(col.GetFlag()))
+// extractKVRanges extracts kv.KeyRanges slice from a SelectRequest.
+func (h *rpcHandler) extractKVRanges(keyRanges []*coprocessor.KeyRange, descScan bool) (kvRanges []kv.KeyRange) {
+	for _, kran := range keyRanges {
+		upperKey := kran.GetEnd()
+		if bytes.Compare(upperKey, h.rawStartKey) <= 0 {
+			continue
+		}
+		lowerKey := kran.GetStart()
+		if len(h.rawEndKey) != 0 && bytes.Compare([]byte(lowerKey), h.rawEndKey) >= 0 {
+			break
+		}
+		var kvr kv.KeyRange
+		kvr.StartKey = kv.Key(maxStartKey(lowerKey, h.rawStartKey))
+		kvr.EndKey = kv.Key(minEndKey(upperKey, h.rawEndKey))
+		kvRanges = append(kvRanges, kvr)
+	}
+	if descScan {
+		reverseKVRanges(kvRanges)
+	}
+	return
+}
+
+func reverseKVRanges(kvRanges []kv.KeyRange) {
+	for i := 0; i < len(kvRanges)/2; i++ {
+		j := len(kvRanges) - i - 1
+		kvRanges[i], kvRanges[j] = kvRanges[j], kvRanges[i]
+	}
+}
+
+func convertToExprs(sc *variable.StatementContext, colIDs map[int64]int, pbExprs []*tipb.Expr) ([]expression.Expression, error) {
+	exprs := make([]expression.Expression, 0, len(pbExprs))
+	for _, expr := range pbExprs {
+		e, err := expression.PBToExpr(expr, colIDs, sc)
+		if err != nil {
+			return nil, errors.Trace(err)
+		}
+		exprs = append(exprs, e)
+	}
+	return exprs, nil
+}
+
+// Flags are used by tipb.SelectRequest.Flags to handle execution mode, like how to handle truncate error.
+const (
+	// FlagIgnoreTruncate indicates if truncate error should be ignored.
+	// Read-only statements should ignore truncate error, write statements should not ignore truncate error.
+	FlagIgnoreTruncate uint64 = 1
+	// FlagTruncateAsWarning indicates if truncate error should be returned as warning.
+	// This flag only matters if FlagIgnoreTruncate is not set, in strict sql mode, truncate error should
+	// be returned as error, in non-strict sql mode, truncate error should be saved as warning.
+	FlagTruncateAsWarning uint64 = 1 << 1
+)
+
+// flagsToStatementContext creates a StatementContext from a `tipb.SelectRequest.Flags`.
+func flagsToStatementContext(flags uint64) *variable.StatementContext {
+	sc := new(variable.StatementContext)
+	sc.IgnoreTruncate = (flags & FlagIgnoreTruncate) > 0
+	sc.TruncateAsWarning = (flags & FlagTruncateAsWarning) > 0
+	return sc
 }

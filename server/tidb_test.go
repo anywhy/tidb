@@ -10,6 +10,7 @@
 // distributed under the License is distributed on an "AS IS" BASIS,
 // See the License for the specific language governing permissions and
 // limitations under the License.
+// +build !race
 
 package server
 
@@ -29,21 +30,27 @@ type TidbTestSuite struct {
 var _ = Suite(new(TidbTestSuite))
 
 func (ts *TidbTestSuite) SetUpSuite(c *C) {
+	log.SetLevelByString("error")
 	store, err := tidb.NewStore("memory:///tmp/tidb")
+	c.Assert(err, IsNil)
+	_, err = tidb.BootstrapSession(store)
 	c.Assert(err, IsNil)
 	ts.tidbdrv = NewTiDBDriver(store)
 	cfg := &Config{
-		Addr:       ":4001",
-		LogLevel:   "debug",
-		StatusAddr: ":10090",
+		Addr:         ":4001",
+		LogLevel:     "debug",
+		StatusAddr:   ":10090",
+		ReportStatus: true,
 	}
 	server, err := NewServer(cfg, ts.tidbdrv)
 	c.Assert(err, IsNil)
 	ts.server = server
 	go ts.server.Run()
-	time.Sleep(time.Millisecond * 100)
+	waitUntilServerOnline(cfg.StatusAddr)
 
-	log.SetLevelByString("error")
+	// Run this test here because parallel would affect the result of it.
+	runTestStmtCount(c)
+	defaultLoadDataBatchCnt = 3
 }
 
 func (ts *TidbTestSuite) TearDownSuite(c *C) {
@@ -54,7 +61,8 @@ func (ts *TidbTestSuite) TearDownSuite(c *C) {
 
 func (ts *TidbTestSuite) TestRegression(c *C) {
 	if regression {
-		runTestRegression(c)
+		c.Parallel()
+		runTestRegression(c, "Regression")
 	}
 }
 
@@ -63,11 +71,17 @@ func (ts *TidbTestSuite) TestUint64(c *C) {
 }
 
 func (ts *TidbTestSuite) TestSpecialType(c *C) {
+	c.Parallel()
 	runTestSpecialType(c)
 }
 
 func (ts *TidbTestSuite) TestPreparedString(c *C) {
+	c.Parallel()
 	runTestPreparedString(c)
+}
+
+func (ts *TidbTestSuite) TestLoadData(c *C) {
+	runTestLoadData(c)
 }
 
 func (ts *TidbTestSuite) TestConcurrentUpdate(c *C) {
@@ -87,6 +101,7 @@ func (ts *TidbTestSuite) TestIssues(c *C) {
 }
 
 func (ts *TidbTestSuite) TestResultFieldTableIsNull(c *C) {
+	c.Parallel()
 	runTestResultFieldTableIsNull(c)
 }
 
@@ -94,7 +109,13 @@ func (ts *TidbTestSuite) TestStatusAPI(c *C) {
 	runTestStatusAPI(c)
 }
 
+func (ts *TidbTestSuite) TestMultiStatements(c *C) {
+	c.Parallel()
+	runTestMultiStatements(c)
+}
+
 func (ts *TidbTestSuite) TestSocket(c *C) {
+	c.Parallel()
 	cfg := &Config{
 		LogLevel:   "debug",
 		StatusAddr: ":10091",
@@ -106,7 +127,7 @@ func (ts *TidbTestSuite) TestSocket(c *C) {
 	time.Sleep(time.Millisecond * 100)
 	tcpDsn := dsn
 	dsn = "root@unix(/tmp/tidbtest.sock)/test?strict=true"
-	runTestRegression(c)
+	runTestRegression(c, "SocketRegression")
 	dsn = tcpDsn
 	server.Close()
 }

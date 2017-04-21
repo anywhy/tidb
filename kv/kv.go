@@ -14,8 +14,7 @@
 package kv
 
 import (
-	"bytes"
-	"io"
+	goctx "golang.org/x/net/context"
 )
 
 // Transaction options
@@ -28,8 +27,22 @@ const (
 	// PresumeKeyNotExistsError is the option key for error.
 	// When PresumeKeyNotExists is set and condition is not match, should throw the error.
 	PresumeKeyNotExistsError
-	// RetryAttempts is the number of txn retry attempt.
-	RetryAttempts
+	// BinlogData is the binlog data to write.
+	BinlogData
+	// Skip existing check when "prewrite".
+	SkipCheckForWrite
+	// SchemaLeaseChecker is used for schema lease check.
+	SchemaLeaseChecker
+)
+
+// Those limits is enforced to make sure the transaction can be well handled by TiKV.
+var (
+	// The limit of single entry size (len(key) + len(value)).
+	TxnEntrySizeLimit = 6 * 1024 * 1024
+	// The limit of number of entries in the MemBuffer.
+	TxnEntryCountLimit uint64 = 300 * 1000
+	// The limit of the sum of all entry size.
+	TxnTotalSizeLimit = 100 * 1024 * 1024
 )
 
 // Retriever is the interface wraps the basic Get and Seek methods.
@@ -63,17 +76,19 @@ type RetrieverMutator interface {
 	Mutator
 }
 
-// MemBuffer is an in-memory kv collection. It should be released after use.
+// MemBuffer is an in-memory kv collection, can be used to buffer write operations.
 type MemBuffer interface {
 	RetrieverMutator
-	// Release releases the buffer.
-	Release()
+	// Size returns sum of keys and values length.
+	Size() int
+	// Len returns the number of entries in the DB.
+	Len() int
 }
 
 // Transaction defines the interface for operations inside a Transaction.
 // This is not thread safe.
 type Transaction interface {
-	RetrieverMutator
+	MemBuffer
 	// Commit commits the transaction operations to KV store.
 	Commit() error
 	// Rollback undoes the transaction operations to KV store.
@@ -89,16 +104,17 @@ type Transaction interface {
 	DelOption(opt Option)
 	// IsReadOnly checks if the transaction has only performed read operations.
 	IsReadOnly() bool
-	// GetClient gets a client instance.
-	GetClient() Client
 	// StartTS returns the transaction start timestamp.
 	StartTS() uint64
+	// Valid returns if the transaction is valid.
+	// A transaction become invalid after commit or rollback.
+	Valid() bool
 }
 
 // Client is used to send request to KV layer.
 type Client interface {
 	// Send sends request to KV layer, returns a Response.
-	Send(req *Request) Response
+	Send(ctx goctx.Context, req *Request) Response
 
 	// SupportRequestType checks if reqType and subType is supported.
 	SupportRequestType(reqType, subType int64) bool
@@ -108,22 +124,13 @@ type Client interface {
 const (
 	ReqTypeSelect = 101
 	ReqTypeIndex  = 102
+	ReqTypeDAG    = 103
 
 	ReqSubTypeBasic   = 0
 	ReqSubTypeDesc    = 10000
 	ReqSubTypeGroupBy = 10001
+	ReqSubTypeTopN    = 10002
 )
-
-// KeyRange represents a range where StartKey <= key < EndKey.
-type KeyRange struct {
-	StartKey Key
-	EndKey   Key
-}
-
-// IsPoint checks if the key range represents a point.
-func (r *KeyRange) IsPoint() bool {
-	return bytes.Equal(r.StartKey.PrefixNext(), r.EndKey)
-}
 
 // Request represents a kv request.
 type Request struct {
@@ -146,7 +153,8 @@ type Request struct {
 type Response interface {
 	// Next returns a resultSubset from a single storage unit.
 	// When full result set is returned, nil is returned.
-	Next() (resultSubset io.ReadCloser, err error)
+	// TODO: Find a better interface for resultSubset that can avoid allocation and reuse bytes.
+	Next() (resultSubset []byte, err error)
 	// Close response.
 	Close() error
 }
@@ -156,8 +164,6 @@ type Snapshot interface {
 	Retriever
 	// BatchGet gets a batch of values from snapshot.
 	BatchGet(keys []Key) (map[string][]byte, error)
-	// Release releases the snapshot to store.
-	Release()
 }
 
 // Driver is the interface that must be implemented by a KV storage.
@@ -172,9 +178,13 @@ type Driver interface {
 type Storage interface {
 	// Begin transaction
 	Begin() (Transaction, error)
+	// BeginWithStartTS begins transaction with startTS.
+	BeginWithStartTS(startTS uint64) (Transaction, error)
 	// GetSnapshot gets a snapshot that is able to read any data which data is <= ver.
 	// if ver is MaxVersion or > current max committed version, we will use current version for this snapshot.
 	GetSnapshot(ver Version) (Snapshot, error)
+	// GetClient gets a client instance.
+	GetClient() Client
 	// Close store
 	Close() error
 	// Storage's unique ID

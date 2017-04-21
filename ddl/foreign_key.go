@@ -22,7 +22,7 @@ import (
 
 func (d *ddl) onCreateForeignKey(t *meta.Meta, job *model.Job) error {
 	schemaID := job.SchemaID
-	tblInfo, err := d.getTableInfo(t, job)
+	tblInfo, err := getTableInfo(t, job, schemaID)
 	if err != nil {
 		return errors.Trace(err)
 	}
@@ -33,25 +33,23 @@ func (d *ddl) onCreateForeignKey(t *meta.Meta, job *model.Job) error {
 		job.State = model.JobCancelled
 		return errors.Trace(err)
 	}
+	fkInfo.ID = allocateIndexID(tblInfo)
 	tblInfo.ForeignKeys = append(tblInfo.ForeignKeys, &fkInfo)
 
-	_, err = t.GenSchemaVersion()
-	if err != nil {
-		return errors.Trace(err)
-	}
-
+	originalState := fkInfo.State
 	switch fkInfo.State {
 	case model.StateNone:
 		// We just support record the foreign key, so we just make it public.
 		// none -> public
 		job.SchemaState = model.StatePublic
 		fkInfo.State = model.StatePublic
-		err = t.UpdateTable(schemaID, tblInfo)
+		ver, err := updateTableInfo(t, job, tblInfo, originalState)
 		if err != nil {
 			return errors.Trace(err)
 		}
-		// finish this job
+		// Finish this job.
 		job.State = model.JobDone
+		job.BinlogInfo.AddTableInfo(ver, tblInfo)
 		return nil
 	default:
 		return ErrInvalidForeignKeyState.Gen("invalid fk state %v", fkInfo.State)
@@ -60,7 +58,7 @@ func (d *ddl) onCreateForeignKey(t *meta.Meta, job *model.Job) error {
 
 func (d *ddl) onDropForeignKey(t *meta.Meta, job *model.Job) error {
 	schemaID := job.SchemaID
-	tblInfo, err := d.getTableInfo(t, job)
+	tblInfo, err := getTableInfo(t, job, schemaID)
 	if err != nil {
 		return errors.Trace(err)
 	}
@@ -84,7 +82,8 @@ func (d *ddl) onDropForeignKey(t *meta.Meta, job *model.Job) error {
 	}
 
 	if !found {
-		return infoschema.ErrForeignKeyNotExists.Gen("foreign key doesn't exist", fkName)
+		job.State = model.JobCancelled
+		return infoschema.ErrForeignKeyNotExists.GenByArgs(fkName)
 	}
 
 	nfks := tblInfo.ForeignKeys[:0]
@@ -95,23 +94,20 @@ func (d *ddl) onDropForeignKey(t *meta.Meta, job *model.Job) error {
 	}
 	tblInfo.ForeignKeys = nfks
 
-	_, err = t.GenSchemaVersion()
-	if err != nil {
-		return errors.Trace(err)
-	}
-
+	originalState := fkInfo.State
 	switch fkInfo.State {
 	case model.StatePublic:
 		// We just support record the foreign key, so we just make it none.
 		// public -> none
 		job.SchemaState = model.StateNone
 		fkInfo.State = model.StateNone
-		err = t.UpdateTable(schemaID, tblInfo)
+		ver, err := updateTableInfo(t, job, tblInfo, originalState)
 		if err != nil {
 			return errors.Trace(err)
 		}
-		// finish this job
+		// Finish this job.
 		job.State = model.JobDone
+		job.BinlogInfo.AddTableInfo(ver, tblInfo)
 		return nil
 	default:
 		return ErrInvalidForeignKeyState.Gen("invalid fk state %v", fkInfo.State)

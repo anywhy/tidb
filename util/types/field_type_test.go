@@ -110,7 +110,7 @@ func (s *testFieldTypeSuite) TestFieldType(c *C) {
 
 func (s *testFieldTypeSuite) TestDefaultTypeForValue(c *C) {
 	defer testleak.AfterTest(c)()
-	cases := []struct {
+	tests := []struct {
 		value interface{}
 		tp    byte
 	}{
@@ -118,19 +118,20 @@ func (s *testFieldTypeSuite) TestDefaultTypeForValue(c *C) {
 		{1, mysql.TypeLonglong},
 		{uint64(1), mysql.TypeLonglong},
 		{"abc", mysql.TypeVarString},
-		{1.1, mysql.TypeNewDecimal},
+		{1.1, mysql.TypeDouble},
 		{[]byte("abc"), mysql.TypeBlob},
-		{mysql.Bit{}, mysql.TypeBit},
-		{mysql.Hex{}, mysql.TypeVarchar},
-		{mysql.Time{Type: mysql.TypeDatetime}, mysql.TypeDatetime},
-		{mysql.Duration{}, mysql.TypeDuration},
-		{mysql.Decimal{}, mysql.TypeNewDecimal},
-		{mysql.Enum{}, mysql.TypeEnum},
-		{mysql.Set{}, mysql.TypeSet},
+		{Bit{}, mysql.TypeBit},
+		{Hex{}, mysql.TypeVarchar},
+		{Time{Type: mysql.TypeDatetime}, mysql.TypeDatetime},
+		{Duration{}, mysql.TypeDuration},
+		{&MyDecimal{}, mysql.TypeNewDecimal},
+		{Enum{}, mysql.TypeEnum},
+		{Set{}, mysql.TypeSet},
 		{nil, mysql.TypeNull},
 	}
-	for _, ca := range cases {
-		ft := DefaultTypeForValue(ca.value)
-		c.Assert(ft.Tp, Equals, ca.tp, Commentf("%v %v", ft, ca))
+	for _, tt := range tests {
+		var ft FieldType
+		DefaultTypeForValue(tt.value, &ft)
+		c.Assert(ft.Tp, Equals, tt.tp, Commentf("%v %v", ft, tt))
 	}
 }

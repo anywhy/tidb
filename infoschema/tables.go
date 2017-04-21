@@ -17,26 +17,39 @@ import (
 	"fmt"
 	"sort"
 
+	"github.com/juju/errors"
+	"github.com/pingcap/tidb/context"
+	"github.com/pingcap/tidb/kv"
 	"github.com/pingcap/tidb/meta/autoid"
 	"github.com/pingcap/tidb/model"
 	"github.com/pingcap/tidb/mysql"
+	"github.com/pingcap/tidb/privilege"
+	"github.com/pingcap/tidb/sessionctx/variable"
+	"github.com/pingcap/tidb/sessionctx/varsutil"
 	"github.com/pingcap/tidb/table"
-	"github.com/pingcap/tidb/table/tables"
 	"github.com/pingcap/tidb/util/charset"
 	"github.com/pingcap/tidb/util/types"
 )
 
 const (
-	tableSchemata      = "SCHEMATA"
-	tableTables        = "TABLES"
-	tableColumns       = "COLUMNS"
-	tableStatistics    = "STATISTICS"
-	tableCharacterSets = "CHARACTER_SETS"
-	tableCollations    = "COLLATIONS"
-	tableFiles         = "FILES"
-	catalogVal         = "def"
-	tableProfiling     = "PROFILING"
-	tablePartitions    = "PARTITIONS"
+	tableSchemata       = "SCHEMATA"
+	tableTables         = "TABLES"
+	tableColumns        = "COLUMNS"
+	tableStatistics     = "STATISTICS"
+	tableCharacterSets  = "CHARACTER_SETS"
+	tableCollations     = "COLLATIONS"
+	tableFiles          = "FILES"
+	catalogVal          = "def"
+	tableProfiling      = "PROFILING"
+	tablePartitions     = "PARTITIONS"
+	tableKeyColumm      = "KEY_COLUMN_USAGE"
+	tableReferConst     = "REFERENTIAL_CONSTRAINTS"
+	tableSessionVar     = "SESSION_VARIABLES"
+	tablePlugins        = "PLUGINS"
+	tableConstraints    = "TABLE_CONSTRAINTS"
+	tableTriggers       = "TRIGGERS"
+	tableUserPrivileges = "USER_PRIVILEGES"
+	tableEngines        = "ENGINES"
 )
 
 type columnInfo struct {
@@ -118,17 +131,18 @@ var tablesCols = []columnInfo{
 	{"TABLE_COMMENT", mysql.TypeVarchar, 2048, 0, nil, nil},
 }
 
+// See: http://dev.mysql.com/doc/refman/5.7/en/columns-table.html
 var columnsCols = []columnInfo{
 	{"TABLE_CATALOG", mysql.TypeVarchar, 512, 0, nil, nil},
 	{"TABLE_SCHEMA", mysql.TypeVarchar, 64, 0, nil, nil},
 	{"TABLE_NAME", mysql.TypeVarchar, 64, 0, nil, nil},
 	{"COLUMN_NAME", mysql.TypeVarchar, 64, 0, nil, nil},
-	{"ORIGINAL_POSITION", mysql.TypeLonglong, 64, 0, nil, nil},
+	{"ORDINAL_POSITION", mysql.TypeLonglong, 64, 0, nil, nil},
 	{"COLUMN_DEFAULT", mysql.TypeBlob, 196606, 0, nil, nil},
 	{"IS_NULLABLE", mysql.TypeVarchar, 3, 0, nil, nil},
 	{"DATA_TYPE", mysql.TypeVarchar, 64, 0, nil, nil},
 	{"CHARACTER_MAXIMUM_LENGTH", mysql.TypeLonglong, 21, 0, nil, nil},
-	{"CHARACTOR_OCTET_LENGTH", mysql.TypeLonglong, 21, 0, nil, nil},
+	{"CHARACTER_OCTET_LENGTH", mysql.TypeLonglong, 21, 0, nil, nil},
 	{"NUMERIC_PRECISION", mysql.TypeLonglong, 21, 0, nil, nil},
 	{"NUMERIC_SCALE", mysql.TypeLonglong, 21, 0, nil, nil},
 	{"DATETIME_PRECISION", mysql.TypeLonglong, 21, 0, nil, nil},
@@ -197,7 +211,58 @@ var collationsCols = []columnInfo{
 	{"SORTLEN", mysql.TypeLonglong, 3, 0, nil, nil},
 }
 
-// See: https://dev.mysql.com/doc/refman/5.7/en/partitions-table.html
+var keyColumnUsageCols = []columnInfo{
+	{"CONSTRAINT_CATALOG", mysql.TypeVarchar, 512, mysql.NotNullFlag, nil, nil},
+	{"CONSTRAINT_SCHEMA", mysql.TypeVarchar, 64, mysql.NotNullFlag, nil, nil},
+	{"CONSTRAINT_NAME", mysql.TypeVarchar, 64, mysql.NotNullFlag, nil, nil},
+	{"TABLE_CATALOG", mysql.TypeVarchar, 512, mysql.NotNullFlag, nil, nil},
+	{"TABLE_SCHEMA", mysql.TypeVarchar, 64, mysql.NotNullFlag, nil, nil},
+	{"TABLE_NAME", mysql.TypeVarchar, 64, mysql.NotNullFlag, nil, nil},
+	{"COLUMN_NAME", mysql.TypeVarchar, 64, mysql.NotNullFlag, nil, nil},
+	{"ORDINAL_POSITION", mysql.TypeLonglong, 10, mysql.NotNullFlag, nil, nil},
+	{"POSITION_IN_UNIQUE_CONSTRAINT", mysql.TypeLonglong, 10, 0, nil, nil},
+	{"REFERENCED_TABLE_SCHEMA", mysql.TypeVarchar, 64, 0, nil, nil},
+	{"REFERENCED_TABLE_NAME", mysql.TypeVarchar, 64, 0, nil, nil},
+	{"REFERENCED_COLUMN_NAME", mysql.TypeVarchar, 64, 0, nil, nil},
+}
+
+// See http://dev.mysql.com/doc/refman/5.7/en/referential-constraints-table.html
+var referConstCols = []columnInfo{
+	{"CONSTRAINT_CATALOG", mysql.TypeVarchar, 512, mysql.NotNullFlag, nil, nil},
+	{"CONSTRAINT_SCHEMA", mysql.TypeVarchar, 64, mysql.NotNullFlag, nil, nil},
+	{"CONSTRAINT_NAME", mysql.TypeVarchar, 64, mysql.NotNullFlag, nil, nil},
+	{"UNIQUE_CONSTRAINT_CATALOG", mysql.TypeVarchar, 512, mysql.NotNullFlag, nil, nil},
+	{"UNIQUE_CONSTRAINT_SCHEMA", mysql.TypeVarchar, 64, mysql.NotNullFlag, nil, nil},
+	{"UNIQUE_CONSTRAINT_NAME", mysql.TypeVarchar, 64, 0, nil, nil},
+	{"MATCH_OPTION", mysql.TypeVarchar, 64, mysql.NotNullFlag, nil, nil},
+	{"UPDATE_RULE", mysql.TypeVarchar, 64, mysql.NotNullFlag, nil, nil},
+	{"DELETE_RULE", mysql.TypeVarchar, 64, mysql.NotNullFlag, nil, nil},
+	{"TABLE_NAME", mysql.TypeVarchar, 64, mysql.NotNullFlag, nil, nil},
+	{"REFERENCED_TABLE_NAME", mysql.TypeVarchar, 64, mysql.NotNullFlag, nil, nil},
+}
+
+// See http://dev.mysql.com/doc/refman/5.7/en/variables-table.html
+var sessionVarCols = []columnInfo{
+	{"VARIABLE_NAME", mysql.TypeVarchar, 64, 0, nil, nil},
+	{"VARIABLE_VALUE", mysql.TypeVarchar, 1024, 0, nil, nil},
+}
+
+// See https://dev.mysql.com/doc/refman/5.7/en/plugins-table.html
+var pluginsCols = []columnInfo{
+	{"PLUGIN_NAME", mysql.TypeVarchar, 64, 0, nil, nil},
+	{"PLUGIN_VERSION", mysql.TypeVarchar, 20, 0, nil, nil},
+	{"PLUGIN_STATUS", mysql.TypeVarchar, 10, 0, nil, nil},
+	{"PLUGIN_TYPE", mysql.TypeVarchar, 80, 0, nil, nil},
+	{"PLUGIN_TYPE_VERSION", mysql.TypeVarchar, 20, 0, nil, nil},
+	{"PLUGIN_LIBRARY", mysql.TypeVarchar, 64, 0, nil, nil},
+	{"PLUGIN_LIBRARY_VERSION", mysql.TypeVarchar, 20, 0, nil, nil},
+	{"PLUGIN_AUTHOR", mysql.TypeVarchar, 64, 0, nil, nil},
+	{"PLUGIN_DESCRIPTION", mysql.TypeLongBlob, types.UnspecifiedLength, 0, nil, nil},
+	{"PLUGIN_LICENSE", mysql.TypeVarchar, 80, 0, nil, nil},
+	{"LOAD_OPTION", mysql.TypeVarchar, 64, 0, nil, nil},
+}
+
+// See https://dev.mysql.com/doc/refman/5.7/en/partitions-table.html
 var partitionsCols = []columnInfo{
 	{"TABLE_CATALOG", mysql.TypeVarchar, 512, 0, nil, nil},
 	{"TABLE_SCHEMA", mysql.TypeVarchar, 64, 0, nil, nil},
@@ -226,6 +291,56 @@ var partitionsCols = []columnInfo{
 	{"TABLESPACE_NAME", mysql.TypeVarchar, 64, 0, nil, nil},
 }
 
+var tableConstraintsCols = []columnInfo{
+	{"CONSTRAINT_CATALOG", mysql.TypeVarchar, 512, 0, nil, nil},
+	{"CONSTRAINT_SCHEMA", mysql.TypeVarchar, 64, 0, nil, nil},
+	{"CONSTRAINT_NAME", mysql.TypeVarchar, 64, 0, nil, nil},
+	{"TABLE_SCHEMA", mysql.TypeVarchar, 64, 0, nil, nil},
+	{"TABLE_NAME", mysql.TypeVarchar, 64, 0, nil, nil},
+	{"CONSTRAINT_TYPE", mysql.TypeVarchar, 64, 0, nil, nil},
+}
+
+var tableTriggersCols = []columnInfo{
+	{"TRIGGER_CATALOG", mysql.TypeVarchar, 512, 0, nil, nil},
+	{"TRIGGER_SCHEMA", mysql.TypeVarchar, 64, 0, nil, nil},
+	{"TRIGGER_NAME", mysql.TypeVarchar, 64, 0, nil, nil},
+	{"EVENT_MANIPULATION", mysql.TypeVarchar, 6, 0, nil, nil},
+	{"EVENT_OBJECT_CATALOG", mysql.TypeVarchar, 512, 0, nil, nil},
+	{"EVENT_OBJECT_SCHEMA", mysql.TypeVarchar, 64, 0, nil, nil},
+	{"EVENT_OBJECT_TABLE", mysql.TypeVarchar, 64, 0, nil, nil},
+	{"ACTION_ORDER", mysql.TypeLonglong, 4, 0, nil, nil},
+	{"ACTION_CONDITION", mysql.TypeBlob, -1, 0, nil, nil},
+	{"ACTION_STATEMENT", mysql.TypeBlob, -1, 0, nil, nil},
+	{"ACTION_ORIENTATION", mysql.TypeVarchar, 9, 0, nil, nil},
+	{"ACTION_TIMING", mysql.TypeVarchar, 6, 0, nil, nil},
+	{"ACTION_REFERENCE_OLD_TABLE", mysql.TypeVarchar, 64, 0, nil, nil},
+	{"ACTION_REFERENCE_NEW_TABLE", mysql.TypeVarchar, 64, 0, nil, nil},
+	{"ACTION_REFERENCE_OLD_ROW", mysql.TypeVarchar, 3, 0, nil, nil},
+	{"ACTION_REFERENCE_NEW_ROW", mysql.TypeVarchar, 3, 0, nil, nil},
+	{"CREATED", mysql.TypeDatetime, 2, 0, nil, nil},
+	{"SQL_MODE", mysql.TypeVarchar, 8192, 0, nil, nil},
+	{"DEFINER", mysql.TypeVarchar, 77, 0, nil, nil},
+	{"CHARACTER_SET_CLIENT", mysql.TypeVarchar, 32, 0, nil, nil},
+	{"COLLATION_CONNECTION", mysql.TypeVarchar, 32, 0, nil, nil},
+	{"DATABASE_COLLATION", mysql.TypeVarchar, 32, 0, nil, nil},
+}
+
+var tableUserPrivilegesCols = []columnInfo{
+	{"GRANTEE", mysql.TypeVarchar, 81, 0, nil, nil},
+	{"TABLE_CATALOG", mysql.TypeVarchar, 512, 0, nil, nil},
+	{"PRIVILEGE_TYPE", mysql.TypeVarchar, 64, 0, nil, nil},
+	{"IS_GRANTABLE", mysql.TypeVarchar, 3, 0, nil, nil},
+}
+
+var tableEnginesCols = []columnInfo{
+	{"ENGINE", mysql.TypeVarchar, 64, 0, nil, nil},
+	{"SUPPORT", mysql.TypeVarchar, 8, 0, nil, nil},
+	{"COMMENT", mysql.TypeVarchar, 80, 0, nil, nil},
+	{"TRANSACTIONS", mysql.TypeVarchar, 3, 0, nil, nil},
+	{"XA", mysql.TypeVarchar, 3, 0, nil, nil},
+	{"SAVEPOINTS", mysql.TypeVarchar, 3, 0, nil, nil},
+}
+
 func dataForCharacterSets() (records [][]types.Datum) {
 	records = append(records,
 		types.MakeDatums("ascii", "ascii_general_ci", "US ASCII", 1),
@@ -244,6 +359,40 @@ func dataForColltions() (records [][]types.Datum) {
 		types.MakeDatums("latin1_swedish_ci", "latin1", 3, "Yes", "Yes", 1),
 		types.MakeDatums("utf8_general_ci", "utf8", 4, "Yes", "Yes", 1),
 		types.MakeDatums("utf8mb4_general_ci", "utf8mb4", 5, "Yes", "Yes", 1),
+	)
+	return records
+}
+
+func dataForSessionVar(ctx context.Context) (records [][]types.Datum, err error) {
+	sessionVars := ctx.GetSessionVars()
+	for _, v := range variable.SysVars {
+		var value string
+		value, err = varsutil.GetSessionSystemVar(sessionVars, v.Name)
+		if err != nil {
+			return nil, errors.Trace(err)
+		}
+		row := types.MakeDatums(v.Name, value)
+		records = append(records, row)
+	}
+	return
+}
+
+func dataForUserPrivileges(ctx context.Context) [][]types.Datum {
+	pm := privilege.GetPrivilegeManager(ctx)
+	return pm.UserPrivilegesTable()
+}
+
+func dataForEngines() (records [][]types.Datum) {
+	records = append(records,
+		types.MakeDatums("InnoDB", "DEFAULT", "Supports transactions, row-level locking, and foreign keys", "YES", "YES", "YES"),
+		types.MakeDatums("CSV", "YES", "CSV storage engine", "NO", "NO", "NO"),
+		types.MakeDatums("MRG_MYISAM", "YES", "Collection of identical MyISAM tables", "NO", "NO", "NO"),
+		types.MakeDatums("BLACKHOLE", "YES", "/dev/null storage engine (anything you write to it disappears)", "NO", "NO", "NO"),
+		types.MakeDatums("MyISAM", "YES", "MyISAM storage engine", "NO", "NO", "NO"),
+		types.MakeDatums("MEMORY", "YES", "Hash based, stored in memory, useful for temporary tables", "NO", "NO", "NO"),
+		types.MakeDatums("ARCHIVE", "YES", "Archive storage engine", "NO", "NO", "NO"),
+		types.MakeDatums("FEDERATED", "NO", "Federated MySQL storage engine", nil, nil, nil),
+		types.MakeDatums("PERFORMANCE_SCHEMA", "YES", "Performance Schema", "NO", "NO", "NO"),
 	)
 	return records
 }
@@ -286,13 +435,12 @@ var filesCols = []columnInfo{
 	{"EXTRA", mysql.TypeVarchar, 255, 0, nil, nil},
 }
 
-func dataForSchemata(schemas []string) [][]types.Datum {
-	sort.Strings(schemas)
+func dataForSchemata(schemas []*model.DBInfo) [][]types.Datum {
 	rows := [][]types.Datum{}
 	for _, schema := range schemas {
 		record := types.MakeDatums(
 			catalogVal,                 // CATALOG_NAME
-			schema,                     // SCHEMA_NAME
+			schema.Name.O,              // SCHEMA_NAME
 			mysql.DefaultCharset,       // DEFAULT_CHARACTER_SET_NAME
 			mysql.DefaultCollationName, // DEFAULT_COLLATION_NAME
 			nil,
@@ -310,7 +458,7 @@ func dataForTables(schemas []*model.DBInfo) [][]types.Datum {
 				catalogVal,          // TABLE_CATALOG
 				schema.Name.O,       // TABLE_SCHEMA
 				table.Name.O,        // TABLE_NAME
-				"BASE_TABLE",        // TABLE_TYPE
+				"BASE TABLE",        // TABLE_TYPE
 				"InnoDB",            // ENGINE
 				uint64(10),          // VERSION
 				"Compact",           // ROW_FORMAT
@@ -360,7 +508,7 @@ func dataForColumnsInTable(schema *model.DBInfo, tbl *model.TableInfo) [][]types
 			decimal = 0
 		}
 		columnType := col.FieldType.CompactStr()
-		columnDesc := table.NewColDesc(&table.Column{ColumnInfo: *col})
+		columnDesc := table.NewColDesc(table.ToColumn(col))
 		var columnDefault interface{}
 		if columnDesc.DefaultValue != nil {
 			columnDefault = fmt.Sprintf("%v", columnDesc.DefaultValue)
@@ -375,7 +523,7 @@ func dataForColumnsInTable(schema *model.DBInfo, tbl *model.TableInfo) [][]types
 			columnDesc.Null,                      // IS_NULLABLE
 			types.TypeToStr(col.Tp, col.Charset), // DATA_TYPE
 			colLen,                            // CHARACTER_MAXIMUM_LENGTH
-			colLen,                            // CHARACTOR_OCTET_LENGTH
+			colLen,                            // CHARACTER_OCTET_LENGTH
 			decimal,                           // NUMERIC_PRECISION
 			0,                                 // NUMERIC_SCALE
 			0,                                 // DATETIME_PRECISION
@@ -471,19 +619,245 @@ func dataForStatisticsInTable(schema *model.DBInfo, table *model.TableInfo) [][]
 	return rows
 }
 
-var tableNameToColumns = map[string]([]columnInfo){
-	tableSchemata:      schemataCols,
-	tableTables:        tablesCols,
-	tableColumns:       columnsCols,
-	tableStatistics:    statisticsCols,
-	tableCharacterSets: charsetCols,
-	tableCollations:    collationsCols,
-	tableFiles:         filesCols,
-	tableProfiling:     profilingCols,
-	tablePartitions:    partitionsCols,
+const (
+	primaryKeyType = "PRIMARY KEY"
+	uniqueKeyType  = "UNIQUE"
+)
+
+// See https://dev.mysql.com/doc/refman/5.7/en/table-constraints-table.html
+func dataForTableConstraints(schemas []*model.DBInfo) [][]types.Datum {
+	rows := [][]types.Datum{}
+	for _, schema := range schemas {
+		for _, tbl := range schema.Tables {
+			if tbl.PKIsHandle {
+				record := types.MakeDatums(
+					catalogVal,           // CONSTRAINT_CATALOG
+					schema.Name.O,        // CONSTRAINT_SCHEMA
+					table.PrimaryKeyName, // CONSTRAINT_NAME
+					schema.Name.O,        // TABLE_SCHEMA
+					tbl.Name.O,           // TABLE_NAME
+					primaryKeyType,       // CONSTRAINT_TYPE
+				)
+				rows = append(rows, record)
+			}
+
+			for _, idx := range tbl.Indices {
+				var cname, ctype string
+				if idx.Primary {
+					cname = table.PrimaryKeyName
+					ctype = primaryKeyType
+				} else if idx.Unique {
+					cname = idx.Name.O
+					ctype = uniqueKeyType
+				} else {
+					// The index has no constriant.
+					continue
+				}
+				record := types.MakeDatums(
+					catalogVal,    // CONSTRAINT_CATALOG
+					schema.Name.O, // CONSTRAINT_SCHEMA
+					cname,         // CONSTRAINT_NAME
+					schema.Name.O, // TABLE_SCHEMA
+					tbl.Name.O,    // TABLE_NAME
+					ctype,         // CONSTRAINT_TYPE
+				)
+				rows = append(rows, record)
+			}
+		}
+	}
+	return rows
 }
 
-func createMemoryTable(meta *model.TableInfo, alloc autoid.Allocator) (table.Table, error) {
-	tbl, _ := tables.MemoryTableFromMeta(alloc, meta)
-	return tbl, nil
+var tableNameToColumns = map[string]([]columnInfo){
+	tableSchemata:       schemataCols,
+	tableTables:         tablesCols,
+	tableColumns:        columnsCols,
+	tableStatistics:     statisticsCols,
+	tableCharacterSets:  charsetCols,
+	tableCollations:     collationsCols,
+	tableFiles:          filesCols,
+	tableProfiling:      profilingCols,
+	tablePartitions:     partitionsCols,
+	tableKeyColumm:      keyColumnUsageCols,
+	tableReferConst:     referConstCols,
+	tableSessionVar:     sessionVarCols,
+	tablePlugins:        pluginsCols,
+	tableConstraints:    tableConstraintsCols,
+	tableTriggers:       tableTriggersCols,
+	tableUserPrivileges: tableUserPrivilegesCols,
+	tableEngines:        tableEnginesCols,
+}
+
+func createInfoSchemaTable(handle *Handle, meta *model.TableInfo) *infoschemaTable {
+	columns := make([]*table.Column, len(meta.Columns))
+	for i, col := range meta.Columns {
+		columns[i] = (*table.Column)(col)
+	}
+	return &infoschemaTable{
+		handle: handle,
+		meta:   meta,
+		cols:   columns,
+	}
+}
+
+type infoschemaTable struct {
+	handle *Handle
+	meta   *model.TableInfo
+	cols   []*table.Column
+	rows   [][]types.Datum
+}
+
+// schemasSorter implements the sort.Interface interface, sorts DBInfo by name.
+type schemasSorter []*model.DBInfo
+
+func (s schemasSorter) Len() int {
+	return len(s)
+}
+
+func (s schemasSorter) Swap(i, j int) {
+	s[i], s[j] = s[j], s[i]
+}
+
+func (s schemasSorter) Less(i, j int) bool {
+	return s[i].Name.L < s[j].Name.L
+}
+
+func (it *infoschemaTable) getRows(ctx context.Context, cols []*table.Column) (fullRows [][]types.Datum, err error) {
+	is := it.handle.Get()
+	dbs := is.AllSchemas()
+	sort.Sort(schemasSorter(dbs))
+	switch it.meta.Name.O {
+	case tableSchemata:
+		fullRows = dataForSchemata(dbs)
+	case tableTables:
+		fullRows = dataForTables(dbs)
+	case tableColumns:
+		fullRows = dataForColumns(dbs)
+	case tableStatistics:
+		fullRows = dataForStatistics(dbs)
+	case tableCharacterSets:
+		fullRows = dataForCharacterSets()
+	case tableCollations:
+		fullRows = dataForColltions()
+	case tableSessionVar:
+		fullRows, err = dataForSessionVar(ctx)
+	case tableConstraints:
+		fullRows = dataForTableConstraints(dbs)
+	case tableFiles:
+	case tableProfiling:
+	case tablePartitions:
+	case tableKeyColumm:
+	case tableReferConst:
+	case tablePlugins, tableTriggers:
+	case tableUserPrivileges:
+		fullRows = dataForUserPrivileges(ctx)
+	case tableEngines:
+		fullRows = dataForEngines()
+	}
+	if err != nil {
+		return nil, errors.Trace(err)
+	}
+	if len(cols) == len(it.cols) {
+		return
+	}
+	rows := make([][]types.Datum, len(fullRows))
+	for i, fullRow := range fullRows {
+		row := make([]types.Datum, len(cols))
+		for j, col := range cols {
+			row[j] = fullRow[col.Offset]
+		}
+		rows[i] = row
+	}
+	return rows, nil
+}
+
+func (it *infoschemaTable) IterRecords(ctx context.Context, startKey kv.Key, cols []*table.Column,
+	fn table.RecordIterFunc) error {
+	if len(startKey) != 0 {
+		return table.ErrUnsupportedOp
+	}
+	rows, err := it.getRows(ctx, cols)
+	if err != nil {
+		return errors.Trace(err)
+	}
+	for i, row := range rows {
+		more, err := fn(int64(i), row, cols)
+		if err != nil {
+			return errors.Trace(err)
+		}
+		if !more {
+			break
+		}
+	}
+	return nil
+}
+
+func (it *infoschemaTable) RowWithCols(ctx context.Context, h int64, cols []*table.Column) ([]types.Datum, error) {
+	return nil, table.ErrUnsupportedOp
+}
+
+// Row implements table.Table Row interface.
+func (it *infoschemaTable) Row(ctx context.Context, h int64) ([]types.Datum, error) {
+	return nil, table.ErrUnsupportedOp
+}
+
+func (it *infoschemaTable) Cols() []*table.Column {
+	return it.cols
+}
+
+func (it *infoschemaTable) WritableCols() []*table.Column {
+	return it.cols
+}
+
+func (it *infoschemaTable) Indices() []table.Index {
+	return nil
+}
+
+func (it *infoschemaTable) RecordPrefix() kv.Key {
+	return nil
+}
+
+func (it *infoschemaTable) IndexPrefix() kv.Key {
+	return nil
+}
+
+func (it *infoschemaTable) FirstKey() kv.Key {
+	return nil
+}
+
+func (it *infoschemaTable) RecordKey(h int64) kv.Key {
+	return nil
+}
+
+func (it *infoschemaTable) AddRecord(ctx context.Context, r []types.Datum) (recordID int64, err error) {
+	return 0, table.ErrUnsupportedOp
+}
+
+func (it *infoschemaTable) RemoveRecord(ctx context.Context, h int64, r []types.Datum) error {
+	return table.ErrUnsupportedOp
+}
+
+func (it *infoschemaTable) UpdateRecord(ctx context.Context, h int64, oldData []types.Datum, newData []types.Datum, touched map[int]bool) error {
+	return table.ErrUnsupportedOp
+}
+
+func (it *infoschemaTable) AllocAutoID() (int64, error) {
+	return 0, table.ErrUnsupportedOp
+}
+
+func (it *infoschemaTable) Allocator() autoid.Allocator {
+	return nil
+}
+
+func (it *infoschemaTable) RebaseAutoID(newBase int64, isSetStep bool) error {
+	return table.ErrUnsupportedOp
+}
+
+func (it *infoschemaTable) Meta() *model.TableInfo {
+	return it.meta
+}
+
+// Seek is the first method called for table scan, we lazy initialize it here.
+func (it *infoschemaTable) Seek(ctx context.Context, h int64) (int64, bool, error) {
+	return 0, false, table.ErrUnsupportedOp
 }

@@ -17,7 +17,7 @@ package mysql
 // Call this when no Flen assigned in ddl.
 // or column value is calculated from an expression.
 // For example: "select count(*) from t;", the column type is int64 and Flen in ResultField will be 21.
-// See: https://dev.mysql.com/doc/refman/5.7/en/storage-requirements.html
+// See https://dev.mysql.com/doc/refman/5.7/en/storage-requirements.html
 func GetDefaultFieldLength(tp byte) int {
 	switch tp {
 	case TypeTiny:
@@ -30,13 +30,13 @@ func GetDefaultFieldLength(tp byte) int {
 		return 11
 	case TypeLonglong:
 		return 21
-	case TypeDecimal, TypeNewDecimal:
-		// See: https://dev.mysql.com/doc/refman/5.7/en/fixed-point-types.html
+	case TypeNewDecimal:
+		// See https://dev.mysql.com/doc/refman/5.7/en/fixed-point-types.html
 		return 10
 	case TypeBit, TypeBlob:
 		return -1
 	default:
-		//TODO: add more types
+		//TODO: Add more types.
 		return -1
 	}
 }
@@ -44,11 +44,13 @@ func GetDefaultFieldLength(tp byte) int {
 // GetDefaultDecimal returns the default decimal length for column.
 func GetDefaultDecimal(tp byte) int {
 	switch tp {
-	case TypeDecimal, TypeNewDecimal:
-		// See: https://dev.mysql.com/doc/refman/5.7/en/fixed-point-types.html
+	case TypeNewDecimal:
+		// See https://dev.mysql.com/doc/refman/5.7/en/fixed-point-types.html
+		return 0
+	case TypeDatetime:
 		return 0
 	default:
-		//TODO: add more types
+		//TODO: Add more types.
 		return -1
 	}
 }

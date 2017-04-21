@@ -16,17 +16,22 @@
 package kv
 
 import (
+	"sync/atomic"
+
 	"github.com/juju/errors"
+	"github.com/pingcap/goleveldb/leveldb"
+	"github.com/pingcap/goleveldb/leveldb/comparer"
+	"github.com/pingcap/goleveldb/leveldb/iterator"
+	"github.com/pingcap/goleveldb/leveldb/memdb"
+	"github.com/pingcap/goleveldb/leveldb/util"
 	"github.com/pingcap/tidb/terror"
-	"github.com/syndtr/goleveldb/leveldb"
-	"github.com/syndtr/goleveldb/leveldb/comparer"
-	"github.com/syndtr/goleveldb/leveldb/iterator"
-	"github.com/syndtr/goleveldb/leveldb/memdb"
-	"github.com/syndtr/goleveldb/leveldb/util"
 )
 
 type memDbBuffer struct {
-	db *memdb.DB
+	db              *memdb.DB
+	entrySizeLimit  int
+	bufferLenLimit  uint64
+	bufferSizeLimit int
 }
 
 type memDbIter struct {
@@ -36,7 +41,12 @@ type memDbIter struct {
 
 // NewMemDbBuffer creates a new memDbBuffer.
 func NewMemDbBuffer() MemBuffer {
-	return &memDbBuffer{db: memdb.New(comparer.DefaultComparer, 4*1024)}
+	return &memDbBuffer{
+		db:              memdb.New(comparer.DefaultComparer, 4*1024),
+		entrySizeLimit:  TxnEntrySizeLimit,
+		bufferLenLimit:  atomic.LoadUint64(&TxnEntryCountLimit),
+		bufferSizeLimit: TxnTotalSizeLimit,
+	}
 }
 
 // Seek creates an Iterator.
@@ -76,7 +86,17 @@ func (m *memDbBuffer) Set(k Key, v []byte) error {
 	if len(v) == 0 {
 		return errors.Trace(ErrCannotSetNilValue)
 	}
+	if len(k)+len(v) > m.entrySizeLimit {
+		return ErrEntryTooLarge.Gen("entry too large, size: %d", len(k)+len(v))
+	}
+
 	err := m.db.Put(k, v)
+	if m.Size() > m.bufferSizeLimit {
+		return ErrTxnTooLarge.Gen("transaction too large, size:%d", m.Size())
+	}
+	if m.Len() > int(m.bufferLenLimit) {
+		return ErrTxnTooLarge.Gen("transaction too large, len:%d", m.Len())
+	}
 	return errors.Trace(err)
 }
 
@@ -86,9 +106,14 @@ func (m *memDbBuffer) Delete(k Key) error {
 	return errors.Trace(err)
 }
 
-// Release reset the buffer.
-func (m *memDbBuffer) Release() {
-	m.db.Reset()
+// Size returns sum of keys and values length.
+func (m *memDbBuffer) Size() int {
+	return m.db.Size()
+}
+
+// Len returns the number of entries in the DB.
+func (m *memDbBuffer) Len() int {
+	return m.db.Len()
 }
 
 // Next implements the Iterator Next.

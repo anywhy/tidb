@@ -29,24 +29,24 @@
 package server
 
 import (
-	"encoding/json"
 	"math/rand"
 	"net"
-	"net/http"
 	"sync"
 	"sync/atomic"
 	"time"
+	// For pprof
+	_ "net/http/pprof"
 
 	"github.com/juju/errors"
 	"github.com/ngaut/log"
-	"github.com/pingcap/tidb"
 	"github.com/pingcap/tidb/mysql"
 	"github.com/pingcap/tidb/terror"
+	"github.com/pingcap/tidb/util"
 	"github.com/pingcap/tidb/util/arena"
 )
 
 var (
-	baseConnID uint32 = 10000
+	baseConnID uint32
 )
 
 var (
@@ -54,6 +54,8 @@ var (
 	errInvalidPayloadLen = terror.ClassServer.New(codeInvalidPayloadLen, "invalid payload length")
 	errInvalidSequence   = terror.ClassServer.New(codeInvalidSequence, "invalid sequence")
 	errInvalidType       = terror.ClassServer.New(codeInvalidType, "invalid type")
+	errNotAllowedCommand = terror.ClassServer.New(codeNotAllowedCommand,
+		"the used command is not allowed with this TiDB version")
 )
 
 // Server is the MySQL protocol server
@@ -64,11 +66,20 @@ type Server struct {
 	rwlock            *sync.RWMutex
 	concurrentLimiter *TokenLimiter
 	clients           map[uint32]*clientConn
+
+	// When a critical error occurred, we don't want to exit the process, because there may be
+	// a supervisor automatically restart it, then new client connection will be created, but we can't server it.
+	// So we just stop the listener and store to force clients to chose other TiDB servers.
+	stopListenerCh chan struct{}
 }
 
 // ConnectionCount gets current connection count.
 func (s *Server) ConnectionCount() int {
-	return len(s.clients)
+	var cnt int
+	s.rwlock.RLock()
+	cnt = len(s.clients)
+	s.rwlock.RUnlock()
+	return cnt
 }
 
 func (s *Server) getToken() *Token {
@@ -80,7 +91,7 @@ func (s *Server) releaseToken(token *Token) {
 }
 
 // Generate a random string using ASCII characters but avoid separator character.
-// See: https://github.com/mysql/mysql-server/blob/5.7/mysys_ssl/crypt_genhash_impl.cc#L435
+// See https://github.com/mysql/mysql-server/blob/5.7/mysys_ssl/crypt_genhash_impl.cc#L435
 func randomBuf(size int) []byte {
 	buf := make([]byte, size)
 	for i := 0; i < size; i++ {
@@ -92,33 +103,37 @@ func randomBuf(size int) []byte {
 	return buf
 }
 
-func (s *Server) newConn(conn net.Conn) (cc *clientConn, err error) {
-	log.Info("newConn", conn.RemoteAddr().String())
-	cc = &clientConn{
+// newConn creates a new *clientConn from a net.Conn.
+// It allocates a connection ID and random salt data for authentication.
+func (s *Server) newConn(conn net.Conn) *clientConn {
+	cc := &clientConn{
 		conn:         conn,
-		pkg:          newPacketIO(conn),
+		pkt:          newPacketIO(conn),
 		server:       s,
 		connectionID: atomic.AddUint32(&baseConnID, 1),
 		collation:    mysql.DefaultCollationID,
-		charset:      mysql.DefaultCharset,
 		alloc:        arena.NewAllocator(32 * 1024),
 	}
+	log.Infof("[%d] new connection %s", cc.connectionID, conn.RemoteAddr().String())
 	cc.salt = randomBuf(20)
-	return
+	return cc
 }
 
 func (s *Server) skipAuth() bool {
 	return s.cfg.SkipAuth
 }
 
+const tokenLimit = 1000
+
 // NewServer creates a new Server.
 func NewServer(cfg *Config, driver IDriver) (*Server, error) {
 	s := &Server{
 		cfg:               cfg,
 		driver:            driver,
-		concurrentLimiter: NewTokenLimiter(100),
+		concurrentLimiter: NewTokenLimiter(tokenLimit),
 		rwlock:            &sync.RWMutex{},
 		clients:           make(map[uint32]*clientConn),
+		stopListenerCh:    make(chan struct{}, 1),
 	}
 
 	var err error
@@ -134,7 +149,7 @@ func NewServer(cfg *Config, driver IDriver) (*Server, error) {
 
 	// Init rand seed for randomBuf()
 	rand.Seed(time.Now().UTC().UnixNano())
-	log.Infof("Server run MySql Protocol Listen at [%s]", s.cfg.Addr)
+	log.Infof("Server run MySQL Protocol Listen at [%s]", s.cfg.Addr)
 	return s, nil
 }
 
@@ -142,8 +157,9 @@ func NewServer(cfg *Config, driver IDriver) (*Server, error) {
 func (s *Server) Run() error {
 
 	// Start http api to report tidb info such as tps.
-	s.startStatusHTTP()
-
+	if s.cfg.ReportStatus {
+		s.startStatusHTTP()
+	}
 	for {
 		conn, err := s.listener.Accept()
 		if err != nil {
@@ -155,8 +171,26 @@ func (s *Server) Run() error {
 			log.Errorf("accept error %s", err.Error())
 			return errors.Trace(err)
 		}
-
+		if s.shouldStopListener() {
+			conn.Close()
+			break
+		}
 		go s.onConn(conn)
+	}
+	s.listener.Close()
+	s.listener = nil
+	for {
+		log.Errorf("listener stopped, waiting for manual kill.")
+		time.Sleep(time.Minute)
+	}
+}
+
+func (s *Server) shouldStopListener() bool {
+	select {
+	case <-s.stopListenerCh:
+		return true
+	default:
+		return false
 	}
 }
 
@@ -171,61 +205,55 @@ func (s *Server) Close() {
 	}
 }
 
+// onConn runs in its own goroutine, handles queries from this connection.
 func (s *Server) onConn(c net.Conn) {
-	conn, err := s.newConn(c)
-	if err != nil {
-		log.Errorf("newConn error %s", errors.ErrorStack(err))
-		return
-	}
+	conn := s.newConn(c)
+	defer func() {
+		log.Infof("[%d] close connection", conn.connectionID)
+	}()
+
 	if err := conn.handshake(); err != nil {
-		log.Errorf("handshake error %s", errors.ErrorStack(err))
+		// Some keep alive services will send request to TiDB and disconnect immediately.
+		// So we use info log level.
+		log.Infof("handshake error %s", errors.ErrorStack(err))
 		c.Close()
 		return
 	}
-	defer func() {
-		log.Infof("close %s", conn)
-	}()
 
 	s.rwlock.Lock()
 	s.clients[conn.connectionID] = conn
+	connections := len(s.clients)
 	s.rwlock.Unlock()
+	connGauge.Set(float64(connections))
 
 	conn.Run()
 }
 
-var once sync.Once
-
-const defaultStatusAddr = ":10080"
-
-func (s *Server) startStatusHTTP() {
-	once.Do(func() {
-		go func() {
-			http.HandleFunc("/status", func(w http.ResponseWriter, req *http.Request) {
-				w.Header().Set("Content-Type", "application/json")
-				s := status{TPS: tidb.GetTPS(), Connections: s.ConnectionCount(), Version: mysql.ServerVersion}
-				js, err := json.Marshal(s)
-				if err != nil {
-					w.WriteHeader(http.StatusInternalServerError)
-					log.Error("Encode json error", err)
-				} else {
-					w.Write(js)
-				}
-
-			})
-			addr := s.cfg.StatusAddr
-			if len(addr) == 0 {
-				addr = defaultStatusAddr
-			}
-			log.Fatal(http.ListenAndServe(addr, nil))
-		}()
-	})
+// ShowProcessList implements the SessionManager interface.
+func (s *Server) ShowProcessList() []util.ProcessInfo {
+	var rs []util.ProcessInfo
+	s.rwlock.RLock()
+	for _, client := range s.clients {
+		rs = append(rs, client.ctx.ShowProcess())
+	}
+	s.rwlock.RUnlock()
+	return rs
 }
 
-// TiDB status
-type status struct {
-	TPS         int64  `json:"tps"`
-	Connections int    `json:"connections"`
-	Version     string `json:"version"`
+// Kill implements the SessionManager interface.
+func (s *Server) Kill(connectionID uint64, query bool) {
+	s.rwlock.Lock()
+	defer s.rwlock.Unlock()
+
+	conn, ok := s.clients[uint32(connectionID)]
+	if !ok {
+		return
+	}
+
+	conn.ctx.Cancel()
+	if !query {
+		conn.killed = true
+	}
 }
 
 // Server error codes.
@@ -234,4 +262,13 @@ const (
 	codeInvalidPayloadLen = 2
 	codeInvalidSequence   = 3
 	codeInvalidType       = 4
+
+	codeNotAllowedCommand = 1148
 )
+
+func init() {
+	serverMySQLErrCodes := map[terror.ErrCode]uint16{
+		codeNotAllowedCommand: mysql.ErrNotAllowedCommand,
+	}
+	terror.ErrClassToMySQLCodes[terror.ClassServer] = serverMySQLErrCodes
+}
