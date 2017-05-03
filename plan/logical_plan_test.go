@@ -27,6 +27,7 @@ import (
 	"github.com/pingcap/tidb/mysql"
 	"github.com/pingcap/tidb/parser"
 	"github.com/pingcap/tidb/sessionctx"
+	"github.com/pingcap/tidb/statistics"
 	"github.com/pingcap/tidb/terror"
 	"github.com/pingcap/tidb/util/mock"
 	"github.com/pingcap/tidb/util/testleak"
@@ -60,7 +61,7 @@ func newStringType() types.FieldType {
 	return *ft
 }
 
-func mockResolve(node ast.Node) (infoschema.InfoSchema, error) {
+func MockResolve(node ast.Node) (infoschema.InfoSchema, error) {
 	indices := []*model.IndexInfo{
 		{
 			Name: model.NewCIStr("c_d_e"),
@@ -154,6 +155,27 @@ func mockResolve(node ast.Node) (infoschema.InfoSchema, error) {
 					Name:   model.NewCIStr("e_str"),
 					Length: types.UnspecifiedLength,
 					Offset: 7,
+				},
+			},
+			State: model.StatePublic,
+		},
+		{
+			Name: model.NewCIStr("e_d_c_str_prefix"),
+			Columns: []*model.IndexColumn{
+				{
+					Name:   model.NewCIStr("e_str"),
+					Length: types.UnspecifiedLength,
+					Offset: 7,
+				},
+				{
+					Name:   model.NewCIStr("d_str"),
+					Length: types.UnspecifiedLength,
+					Offset: 6,
+				},
+				{
+					Name:   model.NewCIStr("c_str"),
+					Length: 10,
+					Offset: 5,
 				},
 			},
 			State: model.StatePublic,
@@ -341,8 +363,35 @@ func mockContext() context.Context {
 		client: &mockClient{},
 	}
 	do := &domain.Domain{}
+	do.CreateStatsHandle(ctx)
 	sessionctx.BindDomain(ctx, do)
 	return ctx
+}
+
+func mockStatsTable(tbl *model.TableInfo, rowCount int64) *statistics.Table {
+	statsTbl := &statistics.Table{
+		TableID: tbl.ID,
+		Count:   rowCount,
+		Columns: make(map[int64]*statistics.Column, len(tbl.Columns)),
+		Indices: make(map[int64]*statistics.Index, len(tbl.Indices)),
+	}
+	return statsTbl
+}
+
+// mockStatsHistogram will create a statistics.Histogram, of which the data is uniform distribution.
+func mockStatsHistogram(id int64, values []types.Datum, repeat int64) *statistics.Histogram {
+	ndv := len(values)
+	histogram := &statistics.Histogram{
+		ID:      id,
+		NDV:     int64(ndv),
+		Buckets: make([]statistics.Bucket, ndv),
+	}
+	for i := 0; i < ndv; i++ {
+		histogram.Buckets[i].Repeats = repeat
+		histogram.Buckets[i].Count = repeat * int64(i+1)
+		histogram.Buckets[i].Value = values[i]
+	}
+	return histogram
 }
 
 func (s *testPlanSuite) TestPredicatePushDown(c *C) {
@@ -486,7 +535,7 @@ func (s *testPlanSuite) TestPredicatePushDown(c *C) {
 		stmt, err := s.ParseOneStmt(ca.sql, "", "")
 		c.Assert(err, IsNil, comment)
 
-		is, err := mockResolve(stmt)
+		is, err := MockResolve(stmt)
 		c.Assert(err, IsNil, comment)
 
 		builder := &planBuilder{
@@ -608,7 +657,7 @@ func (s *testPlanSuite) TestPlanBuilder(c *C) {
 		stmt, err := s.ParseOneStmt(ca.sql, "", "")
 		c.Assert(err, IsNil, comment)
 
-		is, err := mockResolve(stmt)
+		is, err := MockResolve(stmt)
 		c.Assert(err, IsNil)
 
 		builder := &planBuilder{
@@ -662,7 +711,7 @@ func (s *testPlanSuite) TestJoinReOrder(c *C) {
 		stmt, err := s.ParseOneStmt(tt.sql, "", "")
 		c.Assert(err, IsNil, comment)
 
-		is, err := mockResolve(stmt)
+		is, err := MockResolve(stmt)
 		c.Assert(err, IsNil)
 
 		builder := &planBuilder{
@@ -768,7 +817,7 @@ func (s *testPlanSuite) TestAggPushDown(c *C) {
 		stmt, err := s.ParseOneStmt(tt.sql, "", "")
 		c.Assert(err, IsNil, comment)
 
-		is, err := mockResolve(stmt)
+		is, err := MockResolve(stmt)
 		c.Assert(err, IsNil)
 
 		builder := &planBuilder{
@@ -985,7 +1034,7 @@ func (s *testPlanSuite) TestRefine(c *C) {
 		stmt, err := s.ParseOneStmt(tt.sql, "", "")
 		c.Assert(err, IsNil, comment)
 
-		is, err := mockResolve(stmt)
+		is, err := MockResolve(stmt)
 		c.Assert(err, IsNil)
 
 		builder := &planBuilder{
@@ -1123,7 +1172,7 @@ func (s *testPlanSuite) TestColumnPruning(c *C) {
 		stmt, err := s.ParseOneStmt(tt.sql, "", "")
 		c.Assert(err, IsNil, comment)
 
-		is, err := mockResolve(stmt)
+		is, err := MockResolve(stmt)
 		c.Assert(err, IsNil, comment)
 
 		builder := &planBuilder{
@@ -1254,7 +1303,7 @@ func (s *testPlanSuite) TestValidate(c *C) {
 		comment := Commentf("for %s", sql)
 		stmt, err := s.ParseOneStmt(sql, "", "")
 		c.Assert(err, IsNil, comment)
-		is, err := mockResolve(stmt)
+		is, err := MockResolve(stmt)
 		c.Assert(err, IsNil)
 		builder := &planBuilder{
 			allocator: new(idAllocator),
@@ -1358,7 +1407,7 @@ func (s *testPlanSuite) TestUniqueKeyInfo(c *C) {
 		stmt, err := s.ParseOneStmt(tt.sql, "", "")
 		c.Assert(err, IsNil, comment)
 
-		is, err := mockResolve(stmt)
+		is, err := MockResolve(stmt)
 		c.Assert(err, IsNil)
 
 		builder := &planBuilder{
@@ -1407,7 +1456,7 @@ func (s *testPlanSuite) TestAggPrune(c *C) {
 		stmt, err := s.ParseOneStmt(tt.sql, "", "")
 		c.Assert(err, IsNil, comment)
 
-		is, err := mockResolve(stmt)
+		is, err := MockResolve(stmt)
 		c.Assert(err, IsNil)
 
 		builder := &planBuilder{
@@ -1571,7 +1620,7 @@ func (s *testPlanSuite) TestVisitInfo(c *C) {
 		stmt, err := s.ParseOneStmt(tt.sql, "", "")
 		c.Assert(err, IsNil, comment)
 
-		is, err := mockResolve(stmt)
+		is, err := MockResolve(stmt)
 		c.Assert(err, IsNil)
 
 		builder := &planBuilder{
@@ -1744,7 +1793,7 @@ func (s *testPlanSuite) TestTopNPushDown(c *C) {
 		stmt, err := s.ParseOneStmt(tt.sql, "", "")
 		c.Assert(err, IsNil, comment)
 
-		is, err := mockResolve(stmt)
+		is, err := MockResolve(stmt)
 		c.Assert(err, IsNil)
 
 		builder := &planBuilder{

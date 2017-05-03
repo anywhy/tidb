@@ -32,6 +32,7 @@ import (
 	"github.com/pingcap/tidb/ast"
 	"github.com/pingcap/tidb/context"
 	"github.com/pingcap/tidb/mysql"
+	"github.com/pingcap/tidb/sessionctx/variable"
 	"github.com/pingcap/tidb/util/charset"
 	"github.com/pingcap/tidb/util/hack"
 	"github.com/pingcap/tidb/util/stringutil"
@@ -138,6 +139,7 @@ type builtinLengthSig struct {
 	baseBuiltinFunc
 }
 
+// eval evals a builtinLengthSig.
 // See https://dev.mysql.com/doc/refman/5.7/en/string-functions.html
 func (b *builtinLengthSig) eval(row []types.Datum) (d types.Datum, err error) {
 	args, err := b.evalArgs(row)
@@ -169,6 +171,7 @@ type builtinASCIISig struct {
 	baseBuiltinFunc
 }
 
+// eval evals a builtinASCIISig.
 // See https://dev.mysql.com/doc/refman/5.7/en/string-functions.html#function_ascii
 func (b *builtinASCIISig) eval(row []types.Datum) (d types.Datum, err error) {
 	args, err := b.evalArgs(row)
@@ -204,6 +207,7 @@ type builtinConcatSig struct {
 	baseBuiltinFunc
 }
 
+// eval evals a builtinConcatSig.
 // See https://dev.mysql.com/doc/refman/5.7/en/string-functions.html#function_concat
 func (b *builtinConcatSig) eval(row []types.Datum) (d types.Datum, err error) {
 	args, err := b.evalArgs(row)
@@ -238,6 +242,7 @@ type builtinConcatWSSig struct {
 	baseBuiltinFunc
 }
 
+// eval evals a builtinConcatWSSig.
 // See https://dev.mysql.com/doc/refman/5.7/en/string-functions.html#function_concat-ws
 func (b *builtinConcatWSSig) eval(row []types.Datum) (d types.Datum, err error) {
 	args, err := b.evalArgs(row)
@@ -281,6 +286,7 @@ type builtinLeftSig struct {
 	baseBuiltinFunc
 }
 
+// eval evals a builtinLeftSig.
 // See https://dev.mysql.com/doc/refman/5.7/en/string-functions.html#function_left
 func (b *builtinLeftSig) eval(row []types.Datum) (d types.Datum, err error) {
 	args, err := b.evalArgs(row)
@@ -318,7 +324,42 @@ type builtinRightSig struct {
 }
 
 func (b *builtinRightSig) eval(row []types.Datum) (d types.Datum, err error) {
-	return d, errFunctionNotExists.GenByArgs("RIGHT")
+	args, err := b.evalArgs(row)
+	if err != nil {
+		return d, errors.Trace(err)
+	}
+	if len(args) != 2 {
+		return d, nil
+	}
+	arg0, arg1 := args[0], args[1]
+	if arg0.IsNull() || arg1.IsNull() {
+		return d, nil
+	}
+
+	str, err := arg0.ToString()
+	if err != nil {
+		return d, errors.Trace(err)
+	}
+	sc := new(variable.StatementContext)
+	sc.IgnoreTruncate = true
+	length, err := arg1.ToInt64(sc)
+	if err != nil {
+		return d, errors.Trace(err)
+	}
+	if length <= 0 {
+		d.SetString("")
+		return d, nil
+	}
+	var result string
+	strLen := int64(len(str))
+	if strLen >= length {
+		result = str[strLen-length:]
+	} else {
+		result = str
+	}
+	d.SetString(result)
+
+	return d, nil
 }
 
 type repeatFunctionClass struct {
@@ -333,6 +374,7 @@ type builtinRepeatSig struct {
 	baseBuiltinFunc
 }
 
+// eval evals a builtinRepeatSig.
 // See https://dev.mysql.com/doc/refman/5.7/en/string-functions.html#function_repeat
 func (b *builtinRepeatSig) eval(row []types.Datum) (d types.Datum, err error) {
 	args, err := b.evalArgs(row)
@@ -372,6 +414,7 @@ type builtinLowerSig struct {
 	baseBuiltinFunc
 }
 
+// eval evals a builtinLowerSig.
 // See https://dev.mysql.com/doc/refman/5.7/en/string-functions.html#function_lower
 func (b *builtinLowerSig) eval(row []types.Datum) (d types.Datum, err error) {
 	args, err := b.evalArgs(row)
@@ -404,6 +447,7 @@ type builtinReverseSig struct {
 	baseBuiltinFunc
 }
 
+// eval evals a builtinReverseSig.
 // See https://dev.mysql.com/doc/refman/5.7/en/string-functions.html#function_reverse
 func (b *builtinReverseSig) eval(row []types.Datum) (d types.Datum, err error) {
 	args, err := b.evalArgs(row)
@@ -436,7 +480,8 @@ type builtinSpaceSig struct {
 	baseBuiltinFunc
 }
 
-// See http://dev.mysql.com/doc/refman/5.7/en/string-functions.html#function_space
+// eval evals a builtinSpaceSig.
+// See https://dev.mysql.com/doc/refman/5.7/en/string-functions.html#function_space
 func (b *builtinSpaceSig) eval(row []types.Datum) (d types.Datum, err error) {
 	args, err := b.evalArgs(row)
 	if err != nil {
@@ -482,6 +527,7 @@ type builtinUpperSig struct {
 	baseBuiltinFunc
 }
 
+// eval evals a builtinUpperSig.
 // See https://dev.mysql.com/doc/refman/5.7/en/string-functions.html#function_upper
 func (b *builtinUpperSig) eval(row []types.Datum) (d types.Datum, err error) {
 	args, err := b.evalArgs(row)
@@ -514,6 +560,7 @@ type builtinStrcmpSig struct {
 	baseBuiltinFunc
 }
 
+// eval evals a builtinStrcmpSig.
 // See https://dev.mysql.com/doc/refman/5.7/en/string-comparison-functions.html
 func (b *builtinStrcmpSig) eval(row []types.Datum) (d types.Datum, err error) {
 	args, err := b.evalArgs(row)
@@ -548,6 +595,7 @@ type builtinReplaceSig struct {
 	baseBuiltinFunc
 }
 
+// eval evals a builtinReplaceSig.
 // See https://dev.mysql.com/doc/refman/5.7/en/string-functions.html#function_replace
 func (b *builtinReplaceSig) eval(row []types.Datum) (d types.Datum, err error) {
 	args, err := b.evalArgs(row)
@@ -593,6 +641,7 @@ type builtinConvertSig struct {
 	baseBuiltinFunc
 }
 
+// eval evals a builtinConvertSig.
 // See https://dev.mysql.com/doc/refman/5.7/en/cast-functions.html#function_convert
 func (b *builtinConvertSig) eval(row []types.Datum) (d types.Datum, err error) {
 	args, err := b.evalArgs(row)
@@ -706,6 +755,7 @@ type builtinSubstringIndexSig struct {
 	baseBuiltinFunc
 }
 
+// eval evals a builtinSubstringIndexSig.
 // See https://dev.mysql.com/doc/refman/5.7/en/string-functions.html#function_substring-index
 func (b *builtinSubstringIndexSig) eval(row []types.Datum) (d types.Datum, err error) {
 	args, err := b.evalArgs(row)
@@ -769,6 +819,7 @@ type builtinLocateSig struct {
 	baseBuiltinFunc
 }
 
+// eval evals a builtinLocateSig.
 // See https://dev.mysql.com/doc/refman/5.7/en/string-functions.html#function_locate
 func (b *builtinLocateSig) eval(row []types.Datum) (d types.Datum, err error) {
 	args, err := b.evalArgs(row)
@@ -853,7 +904,8 @@ type builtinHexSig struct {
 	baseBuiltinFunc
 }
 
-// See http://dev.mysql.com/doc/refman/5.7/en/string-functions.html#function_hex
+// eval evals a builtinHexSig.
+// See https://dev.mysql.com/doc/refman/5.7/en/string-functions.html#function_hex
 func (b *builtinHexSig) eval(row []types.Datum) (d types.Datum, err error) {
 	args, err := b.evalArgs(row)
 	if err != nil {
@@ -891,7 +943,8 @@ type builtinUnHexSig struct {
 	baseBuiltinFunc
 }
 
-// See http://dev.mysql.com/doc/refman/5.7/en/string-functions.html#function_unhex
+// eval evals a builtinUnHexSig.
+// See https://dev.mysql.com/doc/refman/5.7/en/string-functions.html#function_unhex
 func (b *builtinUnHexSig) eval(row []types.Datum) (d types.Datum, err error) {
 	args, err := b.evalArgs(row)
 	if err != nil {
@@ -939,6 +992,7 @@ type builtinTrimSig struct {
 	baseBuiltinFunc
 }
 
+// eval evals a builtinTrimSig.
 // See https://dev.mysql.com/doc/refman/5.7/en/string-functions.html#function_trim
 func (b *builtinTrimSig) eval(row []types.Datum) (d types.Datum, err error) {
 	args, err := b.evalArgs(row)
@@ -1036,7 +1090,7 @@ func (b *builtinRTrimSig) eval(row []types.Datum) (types.Datum, error) {
 	return trimFn(strings.TrimRight, spaceChars)(args, b.ctx)
 }
 
-// For LTRIM & RTRIM
+// trimFn returns a BuildFunc for ltrim and rtrim.
 // See https://dev.mysql.com/doc/refman/5.7/en/string-functions.html#function_ltrim
 // See https://dev.mysql.com/doc/refman/5.7/en/string-functions.html#function_rtrim
 func trimFn(fn func(string, string) string, cutset string) BuiltinFunc {
@@ -1085,6 +1139,7 @@ type builtinRpadSig struct {
 	baseBuiltinFunc
 }
 
+// eval evals a builtinRpadSig.
 // See https://dev.mysql.com/doc/refman/5.7/en/string-functions.html#function_rpad
 func (b *builtinRpadSig) eval(row []types.Datum) (d types.Datum, err error) {
 	args, err := b.evalArgs(row)
@@ -1135,6 +1190,7 @@ type builtinBitLengthSig struct {
 	baseBuiltinFunc
 }
 
+// eval evals a builtinBitLengthSig.
 // See https://dev.mysql.com/doc/refman/5.7/en/string-functions.html#function_bit-length
 func (b *builtinBitLengthSig) eval(row []types.Datum) (d types.Datum, err error) {
 	args, err := b.evalArgs(row)
@@ -1165,6 +1221,7 @@ type builtinCharSig struct {
 	baseBuiltinFunc
 }
 
+// eval evals a builtinCharSig.
 // See https://dev.mysql.com/doc/refman/5.7/en/string-functions.html#function_char
 func (b *builtinCharSig) eval(row []types.Datum) (d types.Datum, err error) {
 	args, err := b.evalArgs(row)
@@ -1269,6 +1326,7 @@ type builtinCharLengthSig struct {
 	baseBuiltinFunc
 }
 
+// eval evals a builtinCharLengthSig.
 // See https://dev.mysql.com/doc/refman/5.7/en/string-functions.html#function_char-length
 func (b *builtinCharLengthSig) eval(row []types.Datum) (d types.Datum, err error) {
 	args, err := b.evalArgs(row)
@@ -1301,7 +1359,8 @@ type builtinFindInSetSig struct {
 	baseBuiltinFunc
 }
 
-// See http://dev.mysql.com/doc/refman/5.7/en/string-functions.html#function_find-in-set
+// eval evals a builtinFindInSetSig.
+// See https://dev.mysql.com/doc/refman/5.7/en/string-functions.html#function_find-in-set
 // TODO: This function can be optimized by using bit arithmetic when the first argument is
 // a constant string and the second is a column of type SET.
 func (b *builtinFindInSetSig) eval(row []types.Datum) (d types.Datum, err error) {
@@ -1349,7 +1408,8 @@ type builtinFieldSig struct {
 	baseBuiltinFunc
 }
 
-// See http://dev.mysql.com/doc/refman/5.7/en/string-functions.html#function_field
+// eval evals a builtinFieldSig.
+// See https://dev.mysql.com/doc/refman/5.7/en/string-functions.html#function_field
 // Returns the index (position) of arg0 in the arg1, arg2, arg3, ... list.
 // Returns 0 if arg0 is not found.
 // If arg0 is NULL, the return value is 0 because NULL fails equality comparison with any value.
@@ -1432,6 +1492,7 @@ type builtinMakeSetSig struct {
 	baseBuiltinFunc
 }
 
+// eval evals a builtinMakeSetSig.
 // See https://dev.mysql.com/doc/refman/5.7/en/string-functions.html#function_make-set
 func (b *builtinMakeSetSig) eval(row []types.Datum) (d types.Datum, err error) {
 	args, err := b.evalArgs(row)
@@ -1482,6 +1543,7 @@ type builtinOctSig struct {
 	baseBuiltinFunc
 }
 
+// eval evals a builtinOctSig.
 // See https://dev.mysql.com/doc/refman/5.7/en/string-functions.html#function_oct
 func (b *builtinOctSig) eval(row []types.Datum) (d types.Datum, err error) {
 	args, err := b.evalArgs(row)
@@ -1542,6 +1604,7 @@ type builtinOrdSig struct {
 	baseBuiltinFunc
 }
 
+// eval evals a builtinOrdSig.
 // See https://dev.mysql.com/doc/refman/5.7/en/string-functions.html#function_ord
 func (b *builtinOrdSig) eval(row []types.Datum) (d types.Datum, err error) {
 	args, err := b.evalArgs(row)
@@ -1590,6 +1653,7 @@ type builtinQuoteSig struct {
 	baseBuiltinFunc
 }
 
+// eval evals a builtinQuoteSig.
 // See https://dev.mysql.com/doc/refman/5.7/en/string-functions.html#function_quote
 func (b *builtinQuoteSig) eval(row []types.Datum) (d types.Datum, err error) {
 	args, err := b.evalArgs(row)
@@ -1641,6 +1705,7 @@ type builtinBinSig struct {
 	baseBuiltinFunc
 }
 
+// eval evals a builtinBinSig.
 // See https://dev.mysql.com/doc/refman/5.6/en/string-functions.html#function_bin
 func (b *builtinBinSig) eval(row []types.Datum) (d types.Datum, err error) {
 	args, err := b.evalArgs(row)
@@ -1674,6 +1739,7 @@ type builtinEltSig struct {
 	baseBuiltinFunc
 }
 
+// eval evals a builtinEltSig.
 // See https://dev.mysql.com/doc/refman/5.6/en/string-functions.html#function_elt
 func (b *builtinEltSig) eval(row []types.Datum) (d types.Datum, err error) {
 	args, err := b.evalArgs(row)
@@ -1712,6 +1778,7 @@ type builtinExportSetSig struct {
 	baseBuiltinFunc
 }
 
+// eval evals a builtinExportSetSig.
 // See https://dev.mysql.com/doc/refman/5.6/en/string-functions.html#function_export-set
 func (b *builtinExportSetSig) eval(row []types.Datum) (d types.Datum, err error) {
 	args, err := b.evalArgs(row)
@@ -1784,6 +1851,7 @@ type builtinFormatSig struct {
 	baseBuiltinFunc
 }
 
+// eval evals a builtinFormatSig.
 // See https://dev.mysql.com/doc/refman/5.6/en/string-functions.html#function_format
 func (b *builtinFormatSig) eval(row []types.Datum) (d types.Datum, err error) {
 	args, err := b.evalArgs(row)
@@ -1834,6 +1902,7 @@ type builtinFromBase64Sig struct {
 	baseBuiltinFunc
 }
 
+// eval evals a builtinFromBase64Sig.
 // See https://dev.mysql.com/doc/refman/5.6/en/string-functions.html#function_from-base64
 func (b *builtinFromBase64Sig) eval(row []types.Datum) (d types.Datum, err error) {
 	args, err := b.evalArgs(row)
@@ -1868,6 +1937,7 @@ type builtinToBase64Sig struct {
 	baseBuiltinFunc
 }
 
+// eval evals a builtinToBase64Sig.
 // See https://dev.mysql.com/doc/refman/5.7/en/string-functions.html#function_to-base64
 func (b *builtinToBase64Sig) eval(row []types.Datum) (d types.Datum, err error) {
 	args, err := b.evalArgs(row)
@@ -1892,7 +1962,7 @@ func (b *builtinToBase64Sig) eval(row []types.Datum) (d types.Datum, err error) 
 	return d, nil
 }
 
-//func to splite a string every n runes into a string[]
+// splitToSubN splits a string every n runes into a string[]
 func splitToSubN(s string, n int) []string {
 	subs := make([]string, 0, len(s)/n+1)
 	for len(s) > n {
@@ -1915,6 +1985,7 @@ type builtinInsertFuncSig struct {
 	baseBuiltinFunc
 }
 
+// eval evals a builtinInsertFuncSig.
 // See https://dev.mysql.com/doc/refman/5.6/en/string-functions.html#function_insert
 func (b *builtinInsertFuncSig) eval(row []types.Datum) (d types.Datum, err error) {
 	args, err := b.evalArgs(row)
@@ -1976,6 +2047,7 @@ type builtinInstrSig struct {
 	baseBuiltinFunc
 }
 
+// eval evals a builtinInstrSig.
 // See https://dev.mysql.com/doc/refman/5.6/en/string-functions.html#function_instr
 func (b *builtinInstrSig) eval(row []types.Datum) (d types.Datum, err error) {
 	args, err := b.evalArgs(row)
@@ -2033,6 +2105,7 @@ type builtinLoadFileSig struct {
 	baseBuiltinFunc
 }
 
+// eval evals a builtinLoadFileSig.
 // See https://dev.mysql.com/doc/refman/5.6/en/string-functions.html#function_load-file
 func (b *builtinLoadFileSig) eval(row []types.Datum) (d types.Datum, err error) {
 	return d, errFunctionNotExists.GenByArgs("load_file")
@@ -2050,6 +2123,7 @@ type builtinLpadSig struct {
 	baseBuiltinFunc
 }
 
+// eval evals a builtinLpadSig.
 // See https://dev.mysql.com/doc/refman/5.6/en/string-functions.html#function_lpad
 func (b *builtinLpadSig) eval(row []types.Datum) (d types.Datum, err error) {
 	args, err := b.evalArgs(row)

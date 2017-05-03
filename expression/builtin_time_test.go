@@ -611,6 +611,33 @@ func (s *testEvaluatorSuite) TestCurrentTime(c *C) {
 	c.Assert(err, NotNil)
 }
 
+func (s *testEvaluatorSuite) TestUTCTime(c *C) {
+	defer testleak.AfterTest(c)()
+
+	tfStr := "15:04:05"
+	last := time.Now().UTC()
+	fc := funcs[ast.UTCTime]
+
+	tests := []struct {
+		param  interface{}
+		expect int
+	}{{nil, 8}, {0, 8}, {3, 12}, {6, 15}, {-1, 0}, {7, 0}}
+
+	for _, test := range tests {
+		f, err := fc.getFunction(datumsToConstants(types.MakeDatums(test.param)), s.ctx)
+		c.Assert(err, IsNil)
+		v, err := f.eval(nil)
+		if test.expect > 0 {
+			c.Assert(err, IsNil)
+			n := v.GetMysqlDuration()
+			c.Assert(n.String(), HasLen, test.expect)
+			c.Assert(n.String(), GreaterEqual, last.Format(tfStr))
+		} else {
+			c.Assert(err, NotNil)
+		}
+	}
+}
+
 func (s *testEvaluatorSuite) TestUTCDate(c *C) {
 	defer testleak.AfterTest(c)()
 	last := time.Now().UTC()
@@ -1014,6 +1041,46 @@ func (s *testEvaluatorSuite) TestTimestamp(c *C) {
 	c.Assert(d.Kind(), Equals, types.KindNull)
 }
 
+func (s *testEvaluatorSuite) TestMakeDate(c *C) {
+	defer testleak.AfterTest(c)()
+	tbl := []struct {
+		Args []interface{}
+		Want interface{}
+	}{
+		{[]interface{}{71, 1}, "1971-01-01"},
+		{[]interface{}{99, 1}, "1999-01-01"},
+		{[]interface{}{100, 1}, "0100-01-01"},
+		{[]interface{}{69, 1}, "2069-01-01"},
+		{[]interface{}{70, 1}, "1970-01-01"},
+		{[]interface{}{1000, 1}, "1000-01-01"},
+		{[]interface{}{-1, 3660}, nil},
+		{[]interface{}{10000, 3660}, nil},
+		{[]interface{}{2060, 2900025}, "9999-12-31"},
+		{[]interface{}{2060, 2900026}, nil},
+		{[]interface{}{nil, 2900025}, nil},
+		{[]interface{}{2060, nil}, nil},
+		{[]interface{}{nil, nil}, nil},
+		{[]interface{}{"71", 1}, "1971-01-01"},
+		{[]interface{}{71, "1"}, "1971-01-01"},
+		{[]interface{}{"71", "1"}, "1971-01-01"},
+	}
+	Dtbl := tblToDtbl(tbl)
+	maketime := funcs[ast.MakeDate]
+	for idx, t := range Dtbl {
+		f, err := maketime.getFunction(datumsToConstants(t["Args"]), s.ctx)
+		c.Assert(err, IsNil)
+		got, err := f.eval(nil)
+		c.Assert(err, IsNil)
+		if t["Want"][0].Kind() == types.KindNull {
+			c.Assert(got.Kind(), Equals, types.KindNull, Commentf("[%v] - args:%v", idx, t["Args"]))
+		} else {
+			want, err := t["Want"][0].ToString()
+			c.Assert(err, IsNil)
+			c.Assert(got.GetMysqlTime().String(), Equals, want, Commentf("[%v] - args:%v", idx, t["Args"]))
+		}
+	}
+}
+
 func (s *testEvaluatorSuite) TestMakeTime(c *C) {
 	defer testleak.AfterTest(c)()
 	tbl := []struct {
@@ -1120,6 +1187,7 @@ func (s *testEvaluatorSuite) TestQuarter(c *C) {
 	f, err := fc.getFunction(datumsToConstants([]types.Datum{argInvalid}), s.ctx)
 	c.Assert(err, IsNil)
 	result, err := f.eval(nil)
+	c.Assert(err, NotNil)
 	c.Assert(result.IsNull(), IsTrue)
 }
 
